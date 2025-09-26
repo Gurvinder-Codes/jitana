@@ -1,8 +1,14 @@
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.5)
 
 project(Jitana C CXX)
 set(Jitana_VERSION_MAJOR 1)
 set(Jitana_VERSION_MINOR 0)
+
+# ---- Added: enforce a modern C++ standard for Boost >= 1.87 ----
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+# ----------------------------------------------------------------
 
 if(${PROJECT_SOURCE_DIR} STREQUAL ${PROJECT_BINARY_DIR})
     message(FATAL_ERROR "Please build in a separate directory." )
@@ -15,8 +21,9 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E copy
 
 include(CheckCXXCompilerFlag)
 if(${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
-    # Avoid the variadic template bugs in MSVC.
-    add_definitions(-DBOOST_NO_CXX11_VARIADIC_TEMPLATES)
+    # ---- Added: make MSVC report the real __cplusplus value ----
+    add_compile_options(/Zc:__cplusplus)
+    # ------------------------------------------------------------
 else()
     check_cxx_compiler_flag("-std=c++14" COMPILER_SUPPORTS_CXX14)
     check_cxx_compiler_flag("-std=c++1y" COMPILER_SUPPORTS_CXX1Y)
@@ -39,9 +46,14 @@ endif()
 
 include_directories("include")
 
-set(BOOST_MIN_VERSION "1.54.0")
-find_package(Boost ${BOOST_MIN_VERSION}
-    COMPONENTS system iostreams REQUIRED)
+# -----------------------------------------------------------------------------
+# Boost setup (Option A: FindBoost, omit 'system' because it's header-only)
+# -----------------------------------------------------------------------------
+set(Boost_NO_BOOST_CMAKE ON CACHE BOOL "Force FindBoost.cmake" FORCE)
+set(BOOST_MIN_VERSION "1.70")  # Boost.System header-only since 1.70
+
+find_package(Boost ${BOOST_MIN_VERSION} REQUIRED COMPONENTS iostreams)
+
 include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 
 #-------------------------------------------------------------------------------
@@ -76,7 +88,7 @@ add_library(jitana
     ${Jitana_SRC_FILES}
 )
 target_link_libraries(jitana
-    ${Boost_LIBRARIES}
+    ${Boost_LIBRARIES}   # only iostreams is a real library to link
 )
 
 #-------------------------------------------------------------------------------
