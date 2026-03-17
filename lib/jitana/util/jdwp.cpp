@@ -25,7 +25,7 @@
 
 using namespace jitana;
 
-jdwp_connection::jdwp_connection() : socket_(io_service_)
+jdwp_connection::jdwp_connection() : socket_(io_context_)
 {
 }
 
@@ -38,8 +38,8 @@ void jdwp_connection::connect(const std::string& host, const std::string& port)
 {
     using boost::asio::ip::tcp;
 
-    tcp::resolver resolver{io_service_};
-    auto endpoint_it = resolver.resolve(tcp::resolver::query(host, port));
+    tcp::resolver resolver{io_context_};
+    auto endpoint_it = resolver.resolve(host, port);
     boost::asio::connect(socket_, endpoint_it);
 
     // Send the handshake message.

@@ -84,7 +84,7 @@ namespace jitana {
         std::string read_string();
 
     private:
-        boost::asio::io_service io_service_;
+        boost::asio::io_context io_context_;
         boost::asio::ip::tcp::socket socket_;
         uint32_t id_ = 0;
     };

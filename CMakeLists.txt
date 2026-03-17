@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.10)
 
 project(Jitana C CXX)
 set(Jitana_VERSION_MAJOR 1)
@@ -41,7 +41,7 @@ include_directories("include")
 
 set(BOOST_MIN_VERSION "1.54.0")
 find_package(Boost ${BOOST_MIN_VERSION}
-    COMPONENTS system iostreams REQUIRED)
+    COMPONENTS system iostreams filesystem)
 include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 
 #-------------------------------------------------------------------------------
