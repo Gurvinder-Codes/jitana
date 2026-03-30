@@ -39,7 +39,7 @@ void jdwp_connection::connect(const std::string& host, const std::string& port)
     using boost::asio::ip::tcp;
 
     tcp::resolver resolver{io_service_};
-    auto endpoint_it = resolver.resolve(tcp::resolver::query(host, port));
+    auto endpoint_it = resolver.resolve(host, port);
     boost::asio::connect(socket_, endpoint_it);
 
     // Send the handshake message.
