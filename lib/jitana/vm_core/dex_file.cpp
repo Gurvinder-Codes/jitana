@@ -488,7 +488,30 @@ dex_file::load_class(virtual_machine& vm, const std::string& descriptor) const
                     add_edge(*super_v, mv, eprop, mg);
                 }
                 else {
-                    // New entry.
+                    // New entry — also check if this method implements
+                    // any directly-listed interface method. This creates
+                    // method_super_edge_property edges for interface CHA,
+                    // enabling collect_virtual_targets to resolve
+                    // invoke-interface calls to concrete implementations.
+                    for (const auto& iface_v : interface_v_list) {
+                        const auto& iface_vtable
+                                = vm.classes()[iface_v].vtable;
+                        auto iit = std::find_if(
+                                iface_vtable.begin(), iface_vtable.end(),
+                                [&](const dex_method_hdl& h) {
+                                    auto iv = lookup_method_vertex(h, mg);
+                                    return iv && mg[*iv].jvm_hdl.unique_name
+                                                         == unique_name;
+                                });
+                        if (iit != iface_vtable.end()) {
+                            if (auto iface_mv
+                                = lookup_method_vertex(*iit, mg)) {
+                                method_super_edge_property ieprop;
+                                ieprop.interface = true;
+                                add_edge(*iface_mv, mv, ieprop, mg);
+                            }
+                        }
+                    }
                     vtable.push_back(dex_m_hdl);
                 }
             }

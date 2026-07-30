@@ -21,9 +21,12 @@
 #include <jitana/analysis/variable_reuse.hpp>
 #include <jitana/analysis/taint_analysis.hpp>
 #include <jitana/analysis/interproc_param_taint.hpp>
+#include <jitana/analysis/intent_flow.hpp>
+#include <jitana/algorithm/property_tree.hpp>
 
 using namespace jitana;
 
+static constexpr uint8_t BOOTSTRAP_LOADER_ID = 0;
 static constexpr uint8_t LOADER_ID = 100;
 namespace fs = boost::filesystem;
 
@@ -50,22 +53,39 @@ struct TempDirGuard {
 // Wire a single loader and populate classes.
 static bool wire_loader(virtual_machine& vm,
                         const std::vector<std::string>& dex_files,
-                        const std::string& label, bool quiet) {
+                        const std::string& label, bool quiet,
+                        uint8_t loader_id,
+                        const std::string& apk_dir = "") {
     if (dex_files.empty()) {
         std::cerr << "[-] No DEX files provided to wire loader.\n";
         return false;
     }
-    class_loader loader(LOADER_ID, "DFALoader", dex_files.begin(),
+    class_loader loader(loader_id, "DFALoader", dex_files.begin(),
                         dex_files.end());
-    vm.add_loader(loader);
+    // Use bootstrap loader as parent so class lookup can resolve framework
+    // stubs (BroadcastReceiver, Activity, etc.) when loading app classes.
+    vm.add_loader(loader, class_loader_hdl{BOOTSTRAP_LOADER_ID});
 
     // Populate the class graph (available on most Jitana trees).
-    if (!vm.load_all_classes(LOADER_ID)) {
+    if (!vm.load_all_classes(loader_id)) {
         // Suppress warning when quiet - this is just informational
         if (!quiet) {
             std::cerr << "[!] Some classes could not be loaded from " << label
                       << " (likely missing dependencies); continuing with those "
                          "that succeeded.\n";
+        }
+    }
+
+    // Attach apk_info so manifest-based intent routing can work.
+    if (!apk_dir.empty()) {
+        if (auto lv = find_loader_vertex(class_loader_hdl{loader_id},
+                                         vm.loaders())) {
+            try {
+                vm.loaders()[*lv].info = apk_info(apk_dir);
+            }
+            catch (...) {
+                // Manifest not available or unparseable — skip silently.
+            }
         }
     }
 
@@ -99,6 +119,14 @@ static void seed_placeholder_classes(virtual_machine& vm) {
         "Ljava/lang/Runtime;",
         "Ljava/lang/ProcessBuilder;",
         "Ljava/lang/ClassLoader;",
+        "Ljava/lang/Thread;",
+        "Ljava/lang/Runnable;",
+        "Landroid/os/AsyncTask;",
+        // Java reflection
+        "Ljava/lang/reflect/Method;",
+        "Ljava/lang/reflect/Field;",
+        "Ljava/lang/reflect/Constructor;",
+        "Ljava/lang/reflect/AccessibleObject;",
         // Java I/O
         "Ljava/io/PrintStream;",
         "Ljava/io/FileOutputStream;",
@@ -122,15 +150,48 @@ static void seed_placeholder_classes(virtual_machine& vm) {
         "Ljavax/naming/InitialContext;",
         // Android inter-app communication
         "Landroid/content/Context;",
+        "Landroid/content/ContextWrapper;",
+        "Landroid/content/Intent;",
+        "Landroid/app/Activity;",
+        "Landroid/app/Service;",
+        "Landroid/app/Application;",
+        "Landroid/content/BroadcastReceiver;",
+        "Landroid/content/ContentProvider;",
+        "Landroid/content/ContentResolver;",
+        "Landroid/content/ContentValues;",
+        "Landroid/net/Uri;",
+        "Landroid/os/Bundle;",
+        "Landroid/os/IBinder;",
+        // Android UI — needed so View.OnClickListener implementors load
+        "Landroid/view/View;",
+        "Landroid/view/View$OnClickListener;",
+        "Landroid/widget/Button;",
+        "Landroid/widget/TextView;",
+        "Landroid/widget/EditText;",
+        // Android location — source APIs and callback interfaces
+        "Landroid/location/Location;",
+        "Landroid/location/LocationManager;",
+        "Landroid/location/LocationListener;",
+        // Android global callback interfaces (RegisterGlobal patterns)
+        "Landroid/app/Application$ActivityLifecycleCallbacks;",
+        "Landroid/content/ComponentCallbacks2;",
+        "Landroid/content/res/Configuration;",
+        // Android SharedPreferences — interface needed so classes that implement
+        // OnSharedPreferenceChangeListener load successfully (dex_file.cpp
+        // returns boost::none if any directly-listed interface is missing).
+        "Landroid/content/SharedPreferences;",
+        "Landroid/content/SharedPreferences$OnSharedPreferenceChangeListener;",
+        "Landroid/content/SharedPreferences$Editor;",
     };
 
     for (const char* desc : kBootstrapTypes) {
-        ensure_placeholder_class(vm, {class_loader_hdl{LOADER_ID}, desc});
+        ensure_placeholder_class(vm, {class_loader_hdl{BOOTSTRAP_LOADER_ID}, desc});
     }
 }
 
 struct DexSources {
     std::vector<std::string> files;
+    std::string apk_dir; // Extracted APK dir with AndroidManifest.xml; empty for .dex.
     boost::optional<TempDirGuard> temp_guard;
 };
 
@@ -147,12 +208,17 @@ static fs::path make_temp_directory()
 static void extract_apk_classes(const fs::path& apk_path,
                                 const fs::path& out_dir)
 {
+    // Extract DEX files (required).
     std::string cmd = "unzip -qq -o \"" + apk_path.string()
             + "\" \"classes*.dex\" -d \"" + out_dir.string() + "\"";
-    int rc = std::system(cmd.c_str());
-    if (rc != 0) {
+    if (std::system(cmd.c_str()) != 0) {
         throw std::runtime_error("failed to extract classes*.dex from APK");
     }
+    // Extract AndroidManifest.xml for intent routing (optional).
+    std::string mcmd = "unzip -qq -o \"" + apk_path.string()
+            + "\" \"AndroidManifest.xml\" -d \"" + out_dir.string()
+            + "\" 2>/dev/null";
+    std::system(mcmd.c_str()); // ignore failure — manifest may be absent
 }
 
 static DexSources prepare_dex_sources(const std::string& input_path)
@@ -198,6 +264,7 @@ static DexSources prepare_dex_sources(const std::string& input_path)
         }
         std::sort(dex_files.begin(), dex_files.end());
         sources.files = std::move(dex_files);
+        sources.apk_dir = temp_dir.string();
         sources.temp_guard.emplace(temp_dir);
         return sources;
     }
@@ -386,13 +453,16 @@ static std::vector<std::string> get_param_types(const std::string& desc)
 //  ┌──────────────────────────────┐
 //  │  ClassName                   │  ← coloured header
 //  ├──────────────────────────────┤
+//  │  MyApp.apk                   │  ← APK filename (when known)
+//  ├──────────────────────────────┤
 //  │  com.example.package         │  ← small grey package row
 //  ├──────────────────────────────┤
 //  │  methodName(Type, …): Ret    │  ← method signature
 //  └──────────────────────────────┘
 static std::string node_html_label(const analysis::dfa::MethodId& mid,
                                    const std::string& hdr_bg,
-                                   const std::string& hdr_fg)
+                                   const std::string& hdr_fg,
+                                   const std::string& apk_name = "")
 {
     auto cls  = html_escape(type_desc_to_simple(mid.type.descriptor));
     auto pkg  = html_escape(type_desc_to_package(mid.type.descriptor));
@@ -404,6 +474,12 @@ static std::string node_html_label(const analysis::dfa::MethodId& mid,
            " CELLPADDING=\"5\" BGCOLOR=\"white\">";
     out += "<TR><TD BGCOLOR=\"" + hdr_bg + "\" ALIGN=\"CENTER\">"
            "<FONT COLOR=\"" + hdr_fg + "\"><B>" + cls + "</B></FONT></TD></TR>";
+    if (!apk_name.empty()) {
+        out += "<TR><TD ALIGN=\"CENTER\">"
+               "<FONT POINT-SIZE=\"8\" COLOR=\"#2e4057\"><I>"
+               + html_escape(apk_name)
+               + "</I></FONT></TD></TR>";
+    }
     if (!pkg.empty()) {
         out += "<TR><TD ALIGN=\"LEFT\">"
                "<FONT POINT-SIZE=\"8\" COLOR=\"#666666\">" + pkg
@@ -425,8 +501,276 @@ static std::string node_tooltip(const analysis::dfa::MethodId& mid)
 
 // ---------------------------------------------------------------------------
 
-static void write_taint_graph(const std::string& graph_out,
-                              const analysis::dfa::InterprocParamResult& interproc)
+// Returns true for sinks that represent inter-app IPC channels
+// (Intent dispatch, ContentResolver, etc.) so they can be coloured
+// differently from other dangerous sinks in the DOT graph.
+static bool is_interapp_sink(const std::string& type_desc)
+{
+    static const char* kInterappTypes[] = {
+        "Landroid/content/Intent;",
+        "Landroid/content/Context;",
+        "Landroid/app/Activity;",
+        "Landroid/content/ContentResolver;",
+    };
+    for (const char* t : kInterappTypes) {
+        if (type_desc == t) return true;
+    }
+    return false;
+}
+
+// Returns a human-readable origin label for a sink's type descriptor,
+// used in place of an APK name for framework/SDK sink nodes.
+static std::string sink_origin_label(const std::string& type_desc)
+{
+    if (type_desc.rfind("Landroid/", 0) == 0
+        || type_desc.rfind("Lcom/android/", 0) == 0
+        || type_desc.rfind("Ldalvik/", 0) == 0) {
+        return "Android Framework";
+    }
+    if (type_desc.rfind("Ljava/", 0) == 0
+        || type_desc.rfind("Ljavax/", 0) == 0
+        || type_desc.rfind("Lsun/", 0) == 0) {
+        return "Java SDK";
+    }
+    return "Framework";
+}
+
+// ---------------------------------------------------------------------------
+// Inter-app chain: sender IPC call → receiver entry point → downstream sinks.
+
+struct InterAppChain {
+    analysis::dfa::SinkHit sender_hit;    // IPC dispatch in sender APK
+    analysis::dfa::MethodId receiver_entry; // Entry point in receiver APK
+    std::string receiver_apk_name;          // Filename of receiver APK
+    std::vector<analysis::dfa::SinkHit> receiver_sink_hits; // Downstream sinks
+};
+
+static bool is_ipc_dispatch(const std::string& name)
+{
+    return name == "sendBroadcast" || name == "sendOrderedBroadcast"
+        || name == "sendStickyBroadcast" || name == "startActivity"
+        || name == "startActivityForResult" || name == "startService"
+        || name == "startForegroundService" || name == "bindService"
+        || name == "setResult";
+}
+
+// Compute cross-app taint chains by routing each IPC dispatch sink hit to
+// receiver entry points.  Two strategies are used in order:
+//   1. Manifest-based: parse AndroidManifest.xml from each APK to resolve
+//      explicit / implicit intent targets (requires apk_info on loaders).
+//   2. Structural fallback: when no manifest data is available, connect every
+//      IPC dispatch in each loader to all receiver entry-point methods found
+//      in any OTHER loader.  This is permissive but correct for stripped APKs
+//      that contain only a classes.dex file.
+static std::vector<InterAppChain> compute_ipc_chains(
+        virtual_machine& vm,
+        const analysis::dfa::InterprocParamResult& result,
+        const std::unordered_map<uint8_t, std::string>& loader_names)
+{
+    const auto& mg = vm.methods();
+    const auto& lg = vm.loaders();
+
+    // Receiver entry point signatures, keyed by IPC dispatch method name.
+    struct EP { std::string name; std::string desc; };
+    auto get_eps = [](const std::string& sink) -> std::vector<EP> {
+        if (sink == "sendBroadcast" || sink == "sendOrderedBroadcast"
+            || sink == "sendStickyBroadcast")
+            return {{"onReceive",
+                     "(Landroid/content/Context;Landroid/content/Intent;)V"}};
+        if (sink == "startActivity")
+            return {{"onCreate", "(Landroid/os/Bundle;)V"}};
+        if (sink == "startActivityForResult")
+            // Models both direct launch (onCreate) and the return path via
+            // setResult → onActivityResult.
+            return {{"onCreate",          "(Landroid/os/Bundle;)V"},
+                    {"onActivityResult",  "(IILandroid/content/Intent;)V"}};
+        if (sink == "setResult")
+            // setResult(int, Intent) is the sender side of the return path;
+            // the caller's onActivityResult receives the result Intent.
+            return {{"onActivityResult",  "(IILandroid/content/Intent;)V"}};
+        if (sink == "startService" || sink == "startForegroundService"
+            || sink == "bindService")
+            return {{"onStartCommand", "(Landroid/content/Intent;II)I"},
+                    {"onBind",
+                     "(Landroid/content/Intent;)Landroid/os/IBinder;"}};
+        return {};
+    };
+
+    // Collect all loader IDs that have actual app code (non-zero vertex count
+    // excluding the placeholder loader).
+    std::set<uint8_t> app_loader_ids;
+    for (auto mvp = vertices(mg); mvp.first != mvp.second; ++mvp.first) {
+        uint8_t lid = mg[*mvp.first].hdl.file_hdl.loader_hdl.idx;
+        app_loader_ids.insert(lid);
+    }
+
+    // Strategy 1: manifest-based routing.
+    auto explicit_hdls = detail::compute_explicit_intent_handlers(vm);
+    auto implicit_hdls = detail::compute_implicit_intent_handlers(vm);
+    const bool have_manifest = !explicit_hdls.empty() || !implicit_hdls.empty();
+
+    // sender_loader_id → set of target loader IDs.
+    std::unordered_map<uint8_t, std::set<uint8_t>> sender_to_target_lids;
+
+    if (have_manifest) {
+        // Build target sets from manifest handler maps using const-string scan.
+        for (auto mvp = vertices(mg); mvp.first != mvp.second; ++mvp.first) {
+            const auto& m = mg[*mvp.first];
+            uint8_t lid = m.hdl.file_hdl.loader_hdl.idx;
+            for (const auto& iv :
+                 boost::make_iterator_range(vertices(m.insns))) {
+                const auto* cs =
+                        get<insn_const_string>(&m.insns[iv].insn);
+                if (!cs) continue;
+                auto eit = explicit_hdls.find(cs->const_val);
+                if (eit != explicit_hdls.end()) {
+                    for (auto lv : eit->second) {
+                        uint8_t tlid = lg[lv].loader.hdl().idx;
+                        sender_to_target_lids[lid].insert(tlid);
+                    }
+                }
+                auto iit = implicit_hdls.find(cs->const_val);
+                if (iit != implicit_hdls.end()) {
+                    for (auto lv : iit->second) {
+                        uint8_t tlid = lg[lv].loader.hdl().idx;
+                        sender_to_target_lids[lid].insert(tlid);
+                    }
+                }
+            }
+        }
+    }
+    // Structural fallback: for any loader that manifest routing did NOT connect
+    // to any target (e.g. implicit intents with action/MIME type only), connect
+    // it to all other app loaders.  This supplements manifest routing rather
+    // than replacing it, so explicit connections are preserved.
+    for (uint8_t lid : app_loader_ids) {
+        if (sender_to_target_lids.find(lid) == sender_to_target_lids.end()) {
+            for (uint8_t other : app_loader_ids) {
+                if (other != lid)
+                    sender_to_target_lids[lid].insert(other);
+            }
+        }
+    }
+
+    std::vector<InterAppChain> chains;
+    std::set<std::pair<std::string, std::string>> seen;
+
+    // Helper: build a chain for one IPC dispatch identified by caller, offset,
+    // and callee name.  Used for both SinkHit and SourceHit IPC dispatches.
+    auto add_ipc_chains = [&](const analysis::dfa::MethodId& caller,
+                               uint32_t /*offset*/,
+                               const std::string& dispatch_name,
+                               analysis::dfa::SinkHit ipc_hit) {
+        uint8_t sender_lid = caller.type.loader_hdl.idx;
+
+        auto tit = sender_to_target_lids.find(sender_lid);
+        if (tit == sender_to_target_lids.end()) return;
+
+        auto eps = get_eps(dispatch_name);
+        if (eps.empty()) return;
+
+        for (uint8_t target_lid : tit->second) {
+            if (target_lid == sender_lid) continue; // skip intra-app
+
+            for (auto mvp = vertices(mg);
+                 mvp.first != mvp.second; ++mvp.first) {
+                const auto& m = mg[*mvp.first];
+                if (m.hdl.file_hdl.loader_hdl.idx != target_lid) continue;
+
+                for (const auto& ep : eps) {
+                    if (m.jvm_hdl.unique_name != ep.name + ep.desc) continue;
+
+                    auto entry_mid =
+                            analysis::dfa::make_method_id(m.jvm_hdl);
+
+                    auto dedup_key = std::make_pair(
+                            caller.type.descriptor + "." + caller.name
+                                    + "@" + dispatch_name,
+                            m.jvm_hdl.type_hdl.descriptor + "."
+                                    + m.jvm_hdl.unique_name);
+                    if (seen.count(dedup_key)) continue;
+                    seen.insert(dedup_key);
+
+                    std::vector<analysis::dfa::SinkHit> rec_hits;
+                    for (const auto& rh : result.sink_hits) {
+                        if (rh.caller.type.loader_hdl.idx == target_lid
+                            && !is_ipc_dispatch(rh.callee.name))
+                            rec_hits.push_back(rh);
+                    }
+
+                    std::string rec_apk;
+                    auto nit = loader_names.find(target_lid);
+                    if (nit != loader_names.end())
+                        rec_apk = fs::path(nit->second).filename().string();
+
+                    chains.push_back({ipc_hit, entry_mid, rec_apk,
+                                      std::move(rec_hits)});
+                }
+            }
+        }
+    };
+
+    // Route param-taint IPC dispatch sink hits.
+    for (const auto& hit : result.sink_hits) {
+        if (!is_ipc_dispatch(hit.callee.name)) continue;
+        add_ipc_chains(hit.caller, hit.offset, hit.callee.name, hit);
+    }
+
+    // Also route source-to-sink IPC dispatch hits (e.g. startActivityForResult
+    // whose Intent carries source-tainted data placed via putExtra).
+    for (const auto& hit : result.source_sink_hits) {
+        if (!is_ipc_dispatch(hit.sink_callee.name)) continue;
+        // Build a synthetic SinkHit so we can reuse the same chain structure.
+        analysis::dfa::SinkHit ipc_hit;
+        ipc_hit.caller = hit.caller;
+        ipc_hit.offset = hit.sink_offset;
+        ipc_hit.callee = hit.sink_callee;
+        ipc_hit.tainted_args = hit.tainted_args;
+        add_ipc_chains(hit.caller, hit.sink_offset, hit.sink_callee.name,
+                       ipc_hit);
+    }
+
+    return chains;
+}
+
+// ---------------------------------------------------------------------------
+// Edge-label helper: build "argN (Type) tainted\n@ 0xOFF" string.
+
+static std::string make_edge_label(const std::set<int>& tainted_args,
+                                   const std::vector<uint32_t>& offsets,
+                                   const std::string& callee_desc)
+{
+    auto param_types = get_param_types(callee_desc);
+    std::ostringstream out;
+    bool first = true;
+    for (int a : tainted_args) {
+        if (!first) out << "\\n";
+        first = false;
+        std::string hint;
+        if (a == 0) {
+            hint = " (this)";
+        } else {
+            auto idx = static_cast<std::size_t>(a - 1);
+            if (idx < param_types.size())
+                hint = " (" + param_types[idx] + ")";
+        }
+        out << "arg" << a << hint << " tainted";
+    }
+    if (offsets.size() == 1) {
+        out << "\\n@ 0x" << std::hex << offsets[0] << std::dec;
+    } else {
+        out << "\\n" << offsets.size() << " call sites";
+    }
+    return out.str();
+}
+
+// ---------------------------------------------------------------------------
+
+static void write_taint_graph(
+        const std::string& graph_out,
+        const analysis::dfa::InterprocParamResult& interproc,
+        const std::unordered_map<uint8_t, std::string>& loader_names,
+        const std::vector<InterAppChain>& chains)
 {
     std::ofstream ofs(graph_out);
     if (!ofs) {
@@ -435,229 +779,401 @@ static void write_taint_graph(const std::string& graph_out,
         return;
     }
 
-    // Build unique caller and sink node lists.
-    std::vector<analysis::dfa::MethodId> caller_list, sink_list;
-    std::unordered_map<analysis::dfa::MethodId, std::size_t,
-                       analysis::dfa::MethodIdHash>
-            caller_idx, sink_idx;
-
-    // One merged edge per (caller, sink) pair: union of tainted args and all
-    // call-site offsets so parallel edges from the same caller don't clutter
-    // the graph.
-    struct MergedEdge {
-        std::size_t ci, si;
-        std::set<int> tainted_args;
-        std::vector<uint32_t> offsets;
+    // Helper: look up the APK filename for a given MethodId.
+    auto apk_label = [&](const analysis::dfa::MethodId& mid) -> std::string {
+        auto it = loader_names.find(mid.type.loader_hdl.idx);
+        if (it != loader_names.end())
+            return fs::path(it->second).filename().string();
+        return "";
     };
-    std::map<std::pair<std::size_t, std::size_t>, MergedEdge> edge_map;
-
-    for (const auto& hit : interproc.sink_hits) {
-        std::size_t ci, si;
-        {
-            auto it = caller_idx.find(hit.caller);
-            if (it == caller_idx.end()) {
-                ci = caller_list.size();
-                caller_idx[hit.caller] = ci;
-                caller_list.push_back(hit.caller);
-            } else {
-                ci = it->second;
-            }
-        }
-        {
-            auto it = sink_idx.find(hit.callee);
-            if (it == sink_idx.end()) {
-                si = sink_list.size();
-                sink_idx[hit.callee] = si;
-                sink_list.push_back(hit.callee);
-            } else {
-                si = it->second;
-            }
-        }
-        auto key = std::make_pair(ci, si);
-        auto& me = edge_map[key];
-        me.ci = ci;
-        me.si = si;
-        for (std::size_t a : hit.tainted_args) {
-            me.tainted_args.insert(static_cast<int>(a));
-        }
-        me.offsets.push_back(hit.offset);
-    }
-
-    // Threshold: use compact sink-grouped layout for large graphs.
-    static constexpr std::size_t LARGE_GRAPH_THRESHOLD = 15;
-    const bool large_graph = (caller_list.size() > LARGE_GRAPH_THRESHOLD);
-
-    // Group callers by package (small-graph layout only).
-    std::map<std::string, std::vector<std::size_t>> pkg_groups;
-    if (!large_graph) {
-        for (std::size_t i = 0; i < caller_list.size(); ++i) {
-            pkg_groups[type_desc_to_package(caller_list[i].type.descriptor)]
-                    .push_back(i);
-        }
-    }
-    const bool use_pkg_clusters = (!large_graph && pkg_groups.size() > 1);
-
-    // For large graphs: map each sink index → callers that reach it.
-    // A caller reaching multiple sinks is placed in EACH sink's sub-cluster
-    // (using unique node IDs g{ci}_{si}) so every edge stays within its
-    // sink's visual group and no arrows appear to come from nowhere.
-    std::map<std::size_t, std::vector<std::size_t>> sink_caller_groups;
-    if (large_graph) {
-        for (const auto& kv : edge_map) {
-            sink_caller_groups[kv.second.si].push_back(kv.second.ci);
-        }
-    }
 
     // -----------------------------------------------------------------------
-    ofs << "digraph TaintGraph {\n";
-    ofs << "  graph ["
-           "label=\"Parameter Taint Analysis\\n"
-           "Tainted method parameters flow from app methods to dangerous sink"
-           " APIs\","
-           " labelloc=t, fontsize=14, fontname=\"Helvetica\","
-           " bgcolor=\"#fafafa\", pad=\"0.5\""
-           "];\n";
-    ofs << "  rankdir=" << (large_graph ? "LR" : "TB") << ";\n";
-    ofs << "  nodesep=" << (large_graph ? "0.4" : "0.8") << ";\n";
-    ofs << "  ranksep=" << (large_graph ? "2.0" : "1.4") << ";\n";
-    ofs << "  node [shape=none, fontname=\"Helvetica\", fontsize=10];\n";
-    ofs << "  edge [fontname=\"Helvetica\", fontsize=9, penwidth=1.5];\n";
+    // 4-LEVEL LAYOUT (when inter-app chains exist):
+    //   Level 1 (blue)   – Sender methods in the originating APK
+    //   Level 2 (orange) – IPC / inter-app APIs called by the sender
+    //   Level 3 (green)  – Receiver entry points in the target APK
+    //   Level 4 (red)    – Dangerous sink APIs reached from the receiver
+    // -----------------------------------------------------------------------
+    if (!chains.empty()) {
+        // ---- Collect unique nodes for each level --------------------------
+        using MID = analysis::dfa::MethodId;
+        using MIDHash = analysis::dfa::MethodIdHash;
 
-    // -- Cluster: Callers ----------------------------------------------------
-    ofs << "  subgraph cluster_callers {\n";
-    ofs << "    label=\"Methods with tainted parameters\";\n";
-    ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#1a5276\";\n";
-    ofs << "    style=rounded; fillcolor=\"#eaf4fb\";"
-           " color=\"#2471a3\"; penwidth=2;\n";
+        std::vector<MID> senders, ipc_apis, receivers, danger_sinks;
+        std::unordered_map<MID, std::size_t, MIDHash>
+                sender_idx, ipc_idx, recv_idx, danger_idx;
 
-    if (large_graph) {
-        // Flat layout: emit all g{ci}_{si} nodes directly inside
-        // cluster_callers without sub-clusters.  GraphViz is free to
-        // position each node near its target sink, keeping edges short
-        // and horizontal.  Sub-clusters caused tall stacks where nodes
-        // at the top/bottom had steeply diagonal edges that exited the
-        // viewport, making them appear unconnected.
-        for (const auto& kv : sink_caller_groups) {
-            std::size_t si = kv.first;
-            for (std::size_t ci : kv.second) {
-                const auto& mid = caller_list[ci];
-                ofs << "    g" << ci << "_" << si
-                    << " [label=<"
-                    << node_html_label(mid, "#1a5276", "white")
-                    << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
-            }
-        }
-    } else if (use_pkg_clusters) {
-        int pkg_seq = 0;
-        for (const auto& pkv : pkg_groups) {
-            const auto& label = pkv.first.empty() ? "(default package)"
-                                                   : pkv.first;
-            ofs << "    subgraph cluster_pkg" << pkg_seq++ << " {\n";
-            ofs << "      label=\"" << dot_escape(label) << "\";\n";
-            ofs << "      fontsize=10; fontcolor=\"#1a5276\";\n";
-            ofs << "      style=dashed; color=\"#85c1e9\";"
-                   " fillcolor=\"#d6eaf8\";\n";
-            for (std::size_t i : pkv.second) {
-                const auto& mid = caller_list[i];
-                ofs << "      c" << i
-                    << " [label=<"
-                    << node_html_label(mid, "#1a5276", "white")
-                    << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
-            }
-            ofs << "    }\n";
-        }
-    } else {
-        for (std::size_t i = 0; i < caller_list.size(); ++i) {
-            const auto& mid = caller_list[i];
-            ofs << "    c" << i
-                << " [label=<"
-                << node_html_label(mid, "#1a5276", "white")
-                << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
-        }
-    }
-    ofs << "  }\n\n";
+        auto get_or_add = [](std::vector<MID>& list,
+                             std::unordered_map<MID, std::size_t, MIDHash>& idx,
+                             const MID& mid) -> std::size_t {
+            auto it = idx.find(mid);
+            if (it != idx.end()) return it->second;
+            std::size_t i = list.size();
+            idx[mid] = i;
+            list.push_back(mid);
+            return i;
+        };
 
-    // -- Cluster: Sinks ------------------------------------------------------
-    ofs << "  subgraph cluster_sinks {\n";
-    ofs << "    label=\"Dangerous sink APIs\";\n";
-    ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#922b21\";\n";
-    ofs << "    style=rounded; fillcolor=\"#fdedec\";"
-           " color=\"#922b21\"; penwidth=2;\n";
-    for (std::size_t i = 0; i < sink_list.size(); ++i) {
-        const auto& mid = sink_list[i];
-        ofs << "    s" << i
-            << " [label=<"
-            << node_html_label(mid, "#7b241c", "white")
-            << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
-    }
-    ofs << "  }\n\n";
+        // Merged edges: (from_idx, to_idx) → {tainted_args, offsets}
+        struct MEdge { std::set<int> args; std::vector<uint32_t> offs; };
+        std::map<std::pair<std::size_t,std::size_t>, MEdge> se_edges; // sender→IPC
+        std::set<std::pair<std::size_t,std::size_t>> ipc_recv_edges;  // IPC→receiver
+        std::map<std::pair<std::size_t,std::size_t>, MEdge> rd_edges; // receiver→danger
 
-    // -- Edges ---------------------------------------------------------------
-    // One edge per (caller, sink) pair.  Label shows the union of all tainted
-    // argument indices with their type (from the sink's descriptor), plus a
-    // call-site count or the single offset when there is only one.
-    for (const auto& kv : edge_map) {
-        const auto& me = kv.second;
-        const auto& sink_mid = sink_list[me.si];
-        auto param_types = get_param_types(sink_mid.descriptor);
+        // Populate levels from chains.
+        for (const auto& chain : chains) {
+            std::size_t si = get_or_add(senders, sender_idx, chain.sender_hit.caller);
+            std::size_t ii = get_or_add(ipc_apis, ipc_idx,  chain.sender_hit.callee);
 
-        std::ostringstream elabel;
-        bool first_arg = true;
-        for (int a : me.tainted_args) {
-            if (!first_arg) elabel << "\\n";
-            first_arg = false;
+            auto& se = se_edges[{si, ii}];
+            for (std::size_t a : chain.sender_hit.tainted_args)
+                se.args.insert(static_cast<int>(a));
+            se.offs.push_back(chain.sender_hit.offset);
 
-            // Best-effort type annotation:
-            //   arg 0 = "this" for virtual calls (not in descriptor)
-            //   arg k = param_types[k-1] for virtual, param_types[k] for static
-            // We can't distinguish static vs. virtual from MethodId alone, so
-            // show the most informative guess: treat arg 0 as "this" and
-            // map arg k ≥ 1 to param_types[k-1].
-            std::string type_hint;
-            if (a == 0) {
-                type_hint = " (this)";
-            } else {
-                auto idx = static_cast<std::size_t>(a - 1);
-                if (idx < param_types.size()) {
-                    type_hint = " (" + param_types[idx] + ")";
+            if (is_ipc_dispatch(chain.sender_hit.callee.name)) {
+                std::size_t ri = get_or_add(receivers, recv_idx, chain.receiver_entry);
+                ipc_recv_edges.insert({ii, ri});
+
+                for (const auto& rh : chain.receiver_sink_hits) {
+                    std::size_t di = get_or_add(danger_sinks, danger_idx, rh.callee);
+                    auto& re = rd_edges[{ri, di}];
+                    for (std::size_t a : rh.tainted_args)
+                        re.args.insert(static_cast<int>(a));
+                    re.offs.push_back(rh.offset);
                 }
             }
-            elabel << "arg" << a << type_hint << " tainted";
         }
 
-        if (me.offsets.size() == 1) {
-            elabel << "\\n@ 0x" << std::hex << me.offsets[0] << std::dec;
-        } else {
-            elabel << "\\n" << me.offsets.size() << " call sites";
+        // Also add other IPC sink hits from sender methods (e.g. putExtra)
+        // that aren't stored in chain.sender_hit (which holds only the
+        // dispatch call).
+        for (const auto& hit : interproc.sink_hits) {
+            if (!is_interapp_sink(hit.callee.type.descriptor)) continue;
+            auto sit = sender_idx.find(hit.caller);
+            if (sit == sender_idx.end()) continue;
+            std::size_t si = sit->second;
+            std::size_t ii = get_or_add(ipc_apis, ipc_idx, hit.callee);
+            auto& se = se_edges[{si, ii}];
+            for (std::size_t a : hit.tainted_args)
+                se.args.insert(static_cast<int>(a));
+            se.offs.push_back(hit.offset);
         }
 
-        if (large_graph) {
-            ofs << "  g" << me.ci << "_" << me.si << " -> s" << me.si;
-        } else {
-            ofs << "  c" << me.ci << " -> s" << me.si;
+        // ---- Write DOT -------------------------------------------------------
+        ofs << "digraph TaintGraph {\n";
+        ofs << "  graph [label=\"Inter-App Parameter Taint Flow\\n"
+               "Tainted parameters propagate from sender APK through IPC "
+               "boundary to receiver APK\","
+               " labelloc=t, fontsize=14, fontname=\"Helvetica\","
+               " bgcolor=\"#fafafa\", pad=\"0.6\", newrank=true];\n";
+        ofs << "  rankdir=LR;\n";
+        ofs << "  nodesep=0.7;\n";
+        ofs << "  ranksep=2.0;\n";
+        ofs << "  node [shape=none, fontname=\"Helvetica\", fontsize=10];\n";
+        ofs << "  edge [fontname=\"Helvetica\", fontsize=9, penwidth=1.5];\n\n";
+
+        // -- Level 1: Sender methods ------------------------------------------
+        ofs << "  subgraph cluster_senders {\n";
+        ofs << "    label=\"Level 1 — Sender Methods\";\n";
+        ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#1a5276\";\n";
+        ofs << "    style=rounded; fillcolor=\"#eaf4fb\";"
+               " color=\"#2471a3\"; penwidth=2;\n";
+        for (std::size_t i = 0; i < senders.size(); ++i) {
+            const auto& mid = senders[i];
+            ofs << "    S" << i << " [label=<"
+                << node_html_label(mid, "#1a5276", "white", apk_label(mid))
+                << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
         }
-        ofs << " [label=\"" << elabel.str() << "\","
-               " color=\"#e74c3c\", fontcolor=\"#922b21\","
-               " arrowhead=vee];\n";
+        ofs << "  }\n\n";
+
+        // -- Level 2: IPC / inter-app APIs ------------------------------------
+        ofs << "  subgraph cluster_ipc {\n";
+        ofs << "    label=\"Level 2 — IPC / Inter-App APIs\";\n";
+        ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#784212\";\n";
+        ofs << "    style=rounded; fillcolor=\"#fef5e7\";"
+               " color=\"#d35400\"; penwidth=2;\n";
+        for (std::size_t i = 0; i < ipc_apis.size(); ++i) {
+            const auto& mid = ipc_apis[i];
+            ofs << "    I" << i << " [label=<"
+                << node_html_label(mid, "#d35400", "white",
+                                   sink_origin_label(mid.type.descriptor))
+                << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
+        }
+        ofs << "  }\n\n";
+
+        // -- Level 3: Receiver entry points -----------------------------------
+        ofs << "  subgraph cluster_receivers {\n";
+        ofs << "    label=\"Level 3 — Receiver Entry Points\";\n";
+        ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#1e8449\";\n";
+        ofs << "    style=rounded; fillcolor=\"#eafaf1\";"
+               " color=\"#1e8449\"; penwidth=2;\n";
+        for (std::size_t i = 0; i < receivers.size(); ++i) {
+            const auto& mid = receivers[i];
+            std::string rec_apk;
+            for (const auto& ch : chains) {
+                if (ch.receiver_entry == mid) { rec_apk = ch.receiver_apk_name; break; }
+            }
+            ofs << "    R" << i << " [label=<"
+                << node_html_label(mid, "#1e8449", "white", rec_apk)
+                << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
+        }
+        ofs << "  }\n\n";
+
+        // -- Level 4: Dangerous sinks -----------------------------------------
+        ofs << "  subgraph cluster_danger {\n";
+        ofs << "    label=\"Level 4 — Dangerous Sink APIs\";\n";
+        ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#922b21\";\n";
+        ofs << "    style=rounded; fillcolor=\"#fdedec\";"
+               " color=\"#922b21\"; penwidth=2;\n";
+        for (std::size_t i = 0; i < danger_sinks.size(); ++i) {
+            const auto& mid = danger_sinks[i];
+            ofs << "    D" << i << " [label=<"
+                << node_html_label(mid, "#7b241c", "white",
+                                   sink_origin_label(mid.type.descriptor))
+                << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
+        }
+        ofs << "  }\n\n";
+
+        // Enforce 4-column ordering: each level shares the same rank.
+        // newrank=true (set on the graph) allows these to work across clusters.
+        ofs << "  { rank=same;";
+        for (std::size_t i = 0; i < senders.size(); ++i)   ofs << " S" << i << ";";
+        ofs << " }\n";
+        ofs << "  { rank=same;";
+        for (std::size_t i = 0; i < ipc_apis.size(); ++i)  ofs << " I" << i << ";";
+        ofs << " }\n";
+        ofs << "  { rank=same;";
+        for (std::size_t i = 0; i < receivers.size(); ++i) ofs << " R" << i << ";";
+        ofs << " }\n";
+        ofs << "  { rank=same;";
+        for (std::size_t i = 0; i < danger_sinks.size(); ++i) ofs << " D" << i << ";";
+        ofs << " }\n\n";
+
+        // -- Edges: Level 1 → Level 2 -----------------------------------------
+        for (const auto& kv : se_edges) {
+            std::size_t si = kv.first.first, ii = kv.first.second;
+            auto lbl = make_edge_label(kv.second.args, kv.second.offs,
+                                       ipc_apis[ii].descriptor);
+            ofs << "  S" << si << " -> I" << ii
+                << " [label=\"" << lbl << "\","
+                   " color=\"#e67e22\", fontcolor=\"#d35400\","
+                   " arrowhead=vee];\n";
+        }
+
+        // -- Edges: Level 2 → Level 3 (dashed IPC boundary) ------------------
+        for (const auto& p : ipc_recv_edges) {
+            ofs << "  I" << p.first << " -> R" << p.second
+                << " [style=dashed, color=\"#1e8449\", fontcolor=\"#1e8449\","
+                   " label=\"IPC boundary\", arrowhead=open, penwidth=2];\n";
+        }
+
+        // -- Edges: Level 3 → Level 4 -----------------------------------------
+        for (const auto& kv : rd_edges) {
+            std::size_t ri = kv.first.first, di = kv.first.second;
+            auto lbl = make_edge_label(kv.second.args, kv.second.offs,
+                                       danger_sinks[di].descriptor);
+            ofs << "  R" << ri << " -> D" << di
+                << " [label=\"" << lbl << "\","
+                   " color=\"#e74c3c\", fontcolor=\"#922b21\","
+                   " arrowhead=vee];\n";
+        }
+
+        // -- Legend -----------------------------------------------------------
+        ofs << "\n  subgraph cluster_legend {\n";
+        ofs << "    label=\"Legend\"; style=rounded; fontsize=9;\n";
+        ofs << "    fontname=\"Helvetica\"; color=\"#aaaaaa\"; fillcolor=\"#f5f5f5\";\n";
+        ofs << "    node [shape=plaintext, fontsize=9, fontname=\"Helvetica\"];\n";
+        ofs << "    leg [label=\""
+               "Level 1 (Blue)   — Sender method in originating APK\\n"
+               "Level 2 (Orange) — IPC / inter-app API (putExtra, sendBroadcast, ...)\\n"
+               "Level 3 (Green)  — Receiver entry point in target APK\\n"
+               "Level 4 (Red)    — Dangerous sink API reached from receiver\\n"
+               "Dashed arrow     — IPC boundary (data crosses app boundary)\\n"
+               "Solid arrow      — Tainted argument flowing between levels\\n"
+               "  arg 0 = this (virtual calls), arg 1 = first param, ...\"];\n";
+        ofs << "  }\n";
+        ofs << "}\n";
+
+    } else {
+        // -----------------------------------------------------------------------
+        // FALLBACK 2-LEVEL LAYOUT (no inter-app chains detected):
+        //   Callers → Sinks
+        // -----------------------------------------------------------------------
+        std::vector<analysis::dfa::MethodId> caller_list, sink_list;
+        std::unordered_map<analysis::dfa::MethodId, std::size_t,
+                           analysis::dfa::MethodIdHash>
+                caller_idx, sink_idx;
+
+        struct MergedEdge {
+            std::size_t ci, si;
+            std::set<int> tainted_args;
+            std::vector<uint32_t> offsets;
+        };
+        std::map<std::pair<std::size_t, std::size_t>, MergedEdge> edge_map;
+
+        for (const auto& hit : interproc.sink_hits) {
+            std::size_t ci, si;
+            {
+                auto it = caller_idx.find(hit.caller);
+                if (it == caller_idx.end()) {
+                    ci = caller_list.size();
+                    caller_idx[hit.caller] = ci;
+                    caller_list.push_back(hit.caller);
+                } else {
+                    ci = it->second;
+                }
+            }
+            {
+                auto it = sink_idx.find(hit.callee);
+                if (it == sink_idx.end()) {
+                    si = sink_list.size();
+                    sink_idx[hit.callee] = si;
+                    sink_list.push_back(hit.callee);
+                } else {
+                    si = it->second;
+                }
+            }
+            auto key = std::make_pair(ci, si);
+            auto& me = edge_map[key];
+            me.ci = ci; me.si = si;
+            for (std::size_t a : hit.tainted_args)
+                me.tainted_args.insert(static_cast<int>(a));
+            me.offsets.push_back(hit.offset);
+        }
+
+        ofs << "digraph TaintGraph {\n";
+        ofs << "  graph [label=\"Parameter Taint Analysis\\n"
+               "Tainted method parameters flow from app methods to dangerous"
+               " sink APIs\","
+               " labelloc=t, fontsize=14, fontname=\"Helvetica\","
+               " bgcolor=\"#fafafa\", pad=\"0.5\"];\n";
+        ofs << "  rankdir=TB;\n  nodesep=0.8;\n  ranksep=1.4;\n";
+        ofs << "  node [shape=none, fontname=\"Helvetica\", fontsize=10];\n";
+        ofs << "  edge [fontname=\"Helvetica\", fontsize=9, penwidth=1.5];\n";
+
+        ofs << "  subgraph cluster_callers {\n";
+        ofs << "    label=\"Methods with tainted parameters\";\n";
+        ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#1a5276\";\n";
+        ofs << "    style=rounded; fillcolor=\"#eaf4fb\";"
+               " color=\"#2471a3\"; penwidth=2;\n";
+        for (std::size_t i = 0; i < caller_list.size(); ++i) {
+            const auto& mid = caller_list[i];
+            ofs << "    c" << i << " [label=<"
+                << node_html_label(mid, "#1a5276", "white", apk_label(mid))
+                << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
+        }
+        ofs << "  }\n\n";
+
+        ofs << "  subgraph cluster_sinks {\n";
+        ofs << "    label=\"Dangerous / IPC sink APIs\";\n";
+        ofs << "    fontname=\"Helvetica\"; fontsize=12; fontcolor=\"#922b21\";\n";
+        ofs << "    style=rounded; fillcolor=\"#fdedec\";"
+               " color=\"#922b21\"; penwidth=2;\n";
+        for (std::size_t i = 0; i < sink_list.size(); ++i) {
+            const auto& mid = sink_list[i];
+            const bool ipc = is_interapp_sink(mid.type.descriptor);
+            ofs << "    s" << i << " [label=<"
+                << node_html_label(mid, ipc ? "#d35400" : "#7b241c", "white",
+                                   sink_origin_label(mid.type.descriptor))
+                << ">, tooltip=\"" << node_tooltip(mid) << "\"];\n";
+        }
+        ofs << "  }\n\n";
+
+        for (const auto& kv : edge_map) {
+            const auto& me = kv.second;
+            auto lbl = make_edge_label(me.tainted_args, me.offsets,
+                                       sink_list[me.si].descriptor);
+            const bool ipc = is_interapp_sink(sink_list[me.si].type.descriptor);
+            ofs << "  c" << me.ci << " -> s" << me.si
+                << " [label=\"" << lbl << "\","
+                << " color=\"" << (ipc ? "#e67e22" : "#e74c3c") << "\","
+                << " fontcolor=\"" << (ipc ? "#d35400" : "#922b21") << "\","
+                   " arrowhead=vee];\n";
+        }
+
+        ofs << "\n  subgraph cluster_legend {\n";
+        ofs << "    label=\"Legend\"; style=rounded; fontsize=9;\n";
+        ofs << "    fontname=\"Helvetica\"; color=\"#aaaaaa\"; fillcolor=\"#f5f5f5\";\n";
+        ofs << "    node [shape=plaintext, fontsize=9, fontname=\"Helvetica\"];\n";
+        ofs << "    leg [label=\""
+               "Blue header   = app method that passes tainted param to a sink\\n"
+               "Red header    = dangerous API sink (exec / file / network / ...)\\n"
+               "Orange header = inter-app IPC sink (Intent / ContentResolver)\\n"
+               "Solid arrow   = tainted argument flowing to sink\\n"
+               "  arg 0 = this (virtual), arg 1 = first param, ...\"];\n";
+        ofs << "  }\n";
+        ofs << "}\n";
     }
-
-    // -- Legend --------------------------------------------------------------
-    ofs << "\n  subgraph cluster_legend {\n";
-    ofs << "    label=\"Legend\"; style=rounded; fontsize=9;\n";
-    ofs << "    fontname=\"Helvetica\"; color=\"#aaaaaa\"; fillcolor=\"#f5f5f5\";\n";
-    ofs << "    node [shape=plaintext, fontsize=9, fontname=\"Helvetica\"];\n";
-    ofs << "    leg [label="
-           "\"Blue header = app method that passes tainted param to a sink\\n"
-           "Red header  = dangerous API (sink)\\n"
-           "Arrow label = tainted argument index and type\\n"
-           "  arg 0 = this (virtual), arg 1 = first param, ...\"];\n";
-    ofs << "  }\n";
-    ofs << "}\n";
 
     ofs.close();
     std::cerr << "[+] Wrote taint call graph to "
               << fs::absolute(graph_out).string() << " ("
-              << interproc.sink_hits.size() << " sink hit(s))\n";
+              << interproc.sink_hits.size() << " param-taint sink hit(s), "
+              << interproc.source_sink_hits.size() << " source-to-sink hit(s), "
+              << chains.size() << " IPC chain(s))\n";
+}
+
+// Collect JVM type descriptors for Android components that are explicitly
+// disabled in their APK's AndroidManifest.xml (android:enabled="false").
+// These components can never be reached at runtime, so seeding their methods
+// as taint sources only produces false positives.
+static std::vector<std::string>
+collect_disabled_component_prefixes(virtual_machine& vm)
+{
+    std::vector<std::string> result;
+    const auto& lg = vm.loaders();
+    for (const auto& lv : boost::make_iterator_range(vertices(lg))) {
+        const auto* info = get<apk_info>(&lg[lv].info);
+        if (!info) {
+            continue;
+        }
+
+        boost::property_tree::ptree app_pt;
+        try {
+            app_pt = info->manifest_ptree().get_child("application");
+        }
+        catch (...) {
+            continue;
+        }
+
+        const auto& pkg = info->package_name();
+
+        auto check_component = [&](const std::string& comp_type) {
+            for (const auto& x : child_elements(app_pt, comp_type)) {
+                auto enabled = x.second.get_optional<std::string>(
+                        "<xmlattr>.android:enabled");
+                if (!enabled || *enabled != "false") {
+                    continue;
+                }
+                auto name_opt = x.second.get_optional<std::string>(
+                        "<xmlattr>.android:name");
+                if (!name_opt) {
+                    continue;
+                }
+                std::string name = *name_opt;
+                // Resolve relative names against the package.
+                if (!name.empty() && name[0] == '.') {
+                    name = pkg + name;
+                }
+                else if (name.find('.') == std::string::npos) {
+                    name = pkg + '.' + name;
+                }
+                // Convert Java class name → JVM descriptor
+                // (de.ecspride.Foo → Lde/ecspride/Foo;).
+                std::string desc = "L";
+                for (char c : name) {
+                    desc += (c == '.') ? '/' : c;
+                }
+                desc += ';';
+                result.push_back(std::move(desc));
+            }
+        };
+
+        check_component("activity");
+        check_component("service");
+        check_component("receiver");
+    }
+    return result;
 }
 
 int main(int argc, char** argv) {
@@ -685,7 +1201,7 @@ int main(int argc, char** argv) {
         if (positional.empty()) {
             std::cerr << "Usage: " << argv[0]
                       << " [--quiet|-q] [--interproc-only]"
-                         " [--taint-graph FILE] <file.dex|app.apk>\n"
+                         " [--taint-graph FILE] <file.dex|app.apk> ...\n"
                       << "  --quiet, -q        Suppress verbose output"
                          " (taint graph still written if --taint-graph given).\n"
                       << "  --interproc-only   Skip per-method taint output;"
@@ -694,16 +1210,34 @@ int main(int argc, char** argv) {
                          " to sinks to FILE.\n";
             return 2;
         }
-        const std::string input_path = positional.front();
-
-        auto sources = prepare_dex_sources(input_path);
-
         virtual_machine vm;
+        // Create a bootstrap (stub) loader that holds Android/Java framework
+        // placeholder classes.  All app loaders are children of this loader so
+        // that superclass lookup (DFS on loader graph) can always resolve stubs
+        // like BroadcastReceiver, Activity, etc.
+        {
+            class_loader bootstrap(BOOTSTRAP_LOADER_ID, "BootstrapLoader",
+                                   std::vector<std::string>{}.begin(),
+                                   std::vector<std::string>{}.end());
+            vm.add_loader(bootstrap);
+        }
         seed_placeholder_classes(vm);
 
-        if (!wire_loader(vm, sources.files, input_path, quiet)) {
-            std::cerr << "[-] Failed to wire loader.\n";
-            return 1;
+        // Load each input file into its own loader (IDs 100, 101, ...).
+        std::vector<DexSources> all_sources;
+        std::unordered_map<uint8_t, std::string> loader_names;
+        for (std::size_t pi = 0; pi < positional.size(); ++pi) {
+            const auto& input_path = positional[pi];
+            auto sources = prepare_dex_sources(input_path);
+            uint8_t loader_id = static_cast<uint8_t>(LOADER_ID + pi);
+            loader_names[loader_id] = input_path;
+            if (!wire_loader(vm, sources.files, input_path, quiet,
+                             loader_id, sources.apk_dir)) {
+                std::cerr << "[-] Failed to wire loader for: " << input_path
+                          << "\n";
+                return 1;
+            }
+            all_sources.push_back(std::move(sources));
         }
 
         const auto& mg = vm.methods();
@@ -784,7 +1318,71 @@ int main(int argc, char** argv) {
 
         // --- Interprocedural parameter taint (always runs) ---
         analysis::dfa::InterprocParamConfig ipc_cfg;
+        // Exclude bundled framework/library packages from param-taint seeding
+        // to suppress false positives from support libraries shipped inside APKs.
+        // Source-to-sink detection is unaffected (runs in a separate domain).
+        ipc_cfg.param_seed_exclude_prefixes = {
+            "Landroid/support/",   // old Android Support Library
+            "Landroidx/",          // AndroidX
+            "Lcom/google/android/",// Google Play Services / Firebase
+            "Lcom/google/gson/",
+            "Lcom/squareup/",
+            "Lokhttp3/",
+            "Lretrofit2/",
+            "Lkotlin/",
+            "Lkotlinx/",
+        };
+        // Exclude Android components disabled in AndroidManifest.xml
+        // (android:enabled="false") — they cannot be reached at runtime.
+        for (auto& d : collect_disabled_component_prefixes(vm)) {
+            ipc_cfg.param_seed_exclude_prefixes.push_back(std::move(d));
+        }
+        // Skip private methods with no callers: they are unreachable dead code.
+        ipc_cfg.skip_private_no_callers = true;
         auto interproc = analysis::dfa::run_interproc_param_taint(vm, ipc_cfg);
+
+        // Compute IPC chains before printing so the relay-sink filter below can
+        // consult them.  Chains are also needed by the taint-graph writer.
+        auto chains = compute_ipc_chains(vm, interproc, loader_names);
+
+        // Relay sinks (putExtra / putExtras) only place tainted data into an
+        // Intent — they are not a final exfiltration on their own.  Suppress
+        // relay-only hits (both SinkHits and SourceHits) whose caller method
+        // has no confirmed downstream IPC chain.  This removes FPs like
+        // ComponentNotInManifest1 where the target activity is absent from
+        // every loaded manifest so no chain is ever constructed.
+        {
+            std::set<std::string> chained_callers;
+            for (const auto& ch : chains) {
+                chained_callers.insert(
+                        method_id_string(ch.sender_hit.caller));
+            }
+            auto is_relay = [](const std::string& name) {
+                return name == "putExtra" || name == "putExtras";
+            };
+            // Filter param-taint SinkHits for relay methods.
+            auto& ph = interproc.sink_hits;
+            ph.erase(
+                std::remove_if(ph.begin(), ph.end(),
+                    [&](const analysis::dfa::SinkHit& h) {
+                        return is_relay(h.callee.name)
+                               && chained_callers.find(
+                                      method_id_string(h.caller))
+                                      == chained_callers.end();
+                    }),
+                ph.end());
+            // Filter source-to-sink SourceHits for relay methods.
+            auto& sh = interproc.source_sink_hits;
+            sh.erase(
+                std::remove_if(sh.begin(), sh.end(),
+                    [&](const analysis::dfa::SourceHit& h) {
+                        return is_relay(h.sink_callee.name)
+                               && chained_callers.find(
+                                      method_id_string(h.caller))
+                                      == chained_callers.end();
+                    }),
+                sh.end());
+        }
 
         if (!quiet) {
             if (interproc_only) {
@@ -847,15 +1445,55 @@ int main(int argc, char** argv) {
                               << " @off " << hit.offset << "\n";
                 }
             }
+
+            // Print source-to-sink hits (relay hits already filtered above).
+            std::cout << "\n[+] Source-to-sink flows\n";
+            if (interproc.source_sink_hits.empty()) {
+                std::cout << "    (none found)\n";
+            } else {
+                for (const auto& hit : interproc.source_sink_hits) {
+                    auto caller_str = method_id_string(hit.caller);
+                    auto src_str = method_id_string(hit.source_callee);
+                    auto sink_str = method_id_string(hit.sink_callee);
+                    std::ostringstream args_ss;
+                    for (std::size_t i = 0; i < hit.tainted_args.size(); ++i) {
+                        args_ss << "arg" << hit.tainted_args[i];
+                        if (i + 1 < hit.tainted_args.size()) args_ss << ",";
+                    }
+                    std::cout << "    [in " << caller_str << "] "
+                              << (src_str.empty() ? "<source>" : src_str)
+                              << " -> " << sink_str
+                              << " (" << args_ss.str() << ")"
+                              << " @off " << hit.sink_offset << "\n";
+                }
+            }
+        }
+        if (!quiet && !chains.empty()) {
+            std::cout << "\n[+] Inter-app IPC chains (" << chains.size()
+                      << " found)\n";
+            for (const auto& ch : chains) {
+                std::cout << "    " << method_id_string(ch.sender_hit.caller)
+                          << " -> " << ch.sender_hit.callee.name
+                          << " ~~[IPC]~~ "
+                          << method_id_string(ch.receiver_entry)
+                          << " [" << ch.receiver_apk_name << "]";
+                if (!ch.receiver_sink_hits.empty()) {
+                    std::cout << " -> "
+                              << ch.receiver_sink_hits.size()
+                              << " downstream sink(s)";
+                }
+                std::cout << "\n";
+            }
         }
 
         // --- Write taint graph (independent of --quiet) ---
         if (!graph_out.empty()) {
-            if (interproc.sink_hits.empty()) {
+            if (interproc.sink_hits.empty()
+                && interproc.source_sink_hits.empty()) {
                 std::cerr << "[-] No sink hits found; graph file not written.\n";
                 return 1;
             }
-            write_taint_graph(graph_out, interproc);
+            write_taint_graph(graph_out, interproc, loader_names, chains);
         }
 
         return 0;
