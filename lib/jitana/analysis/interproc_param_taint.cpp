@@ -1166,52 +1166,36 @@ namespace {
                                             sinks, sink_hits, sources,
                                             source_sink_hits);
 
-                                    // Field-taint doesn't ride along with
-                                    // bridge_ctx/bridge_src_ctx above (those
-                                    // are register-only, and get_or_compute_ctx
-                                    // is cached so pre_src_field_taint can't be
-                                    // threaded through it without becoming part
-                                    // of the cache key). Mirror the static
-                                    // -field one-level-deep probe elsewhere in
-                                    // this loop: if this caller's own
-                                    // src_field_taint has STATIC:/FIELD:
-                                    // entries (e.g. an inner AsyncTask's
-                                    // captured this$0 outer-instance field, or
-                                    // a singleton reached via a static field —
-                                    // both export as instance-insensitive
-                                    // "FIELD:"/"STATIC:" keys, see
-                                    // source_field_writes export below), feed
-                                    // them into a direct, uncached
-                                    // compute_summary_ctx call so
-                                    // doInBackground can see them. This is the
-                                    // common "AsyncTask constructed with empty
-                                    // Void params, reads a field set before
-                                    // .execute() was called" pattern that the
-                                    // array-argument bridging above doesn't
-                                    // cover at all.
-                                    if (!src_field_taint.empty()
-                                        && !cache.in_progress.count(
-                                                CtxKey{bridge_mid, bridge_ctx,
-                                                       bridge_src_ctx})) {
-                                        std::unordered_set<std::string>
-                                                global_sft;
-                                        for (const auto& sk : src_field_taint) {
-                                            if (sk.rfind("STATIC:", 0) == 0
-                                                || sk.rfind("FIELD:", 0) == 0) {
-                                                global_sft.insert(sk);
-                                            }
-                                        }
-                                        if (!global_sft.empty()) {
-                                            compute_summary_ctx(
-                                                    vm, bridge_mid,
-                                                    bridge_mv->second, cg,
-                                                    bridge_ctx, bridge_src_ctx,
-                                                    global_sft, cache,
-                                                    lib_policy, sinks,
-                                                    sink_hits, sources,
-                                                    source_sink_hits);
-                                        }
-                                    }
+                                    // A field-taint variant of this bridge
+                                    // call (threading this caller's
+                                    // STATIC:/FIELD: src_field_taint entries
+                                    // into doInBackground via a direct,
+                                    // uncached compute_summary_ctx call, to
+                                    // catch the "AsyncTask constructed with
+                                    // empty Void params, reads a field set
+                                    // before .execute()" pattern) was tried
+                                    // and reverted: it caused real SIGSEGV
+                                    // stack-overflow crashes on TaintBench
+                                    // apps (hummingbad_android_samp.apk,
+                                    // scipiex.apk, vibleaker_android_samp.apk)
+                                    // because a direct compute_summary_ctx
+                                    // call never registers bridge_mid in
+                                    // cache.in_progress the way
+                                    // get_or_compute_ctx does — so if
+                                    // doInBackground itself contains another
+                                    // .execute() call (directly or via a
+                                    // helper), this recursed into itself with
+                                    // no cycle guard at all, unlike every
+                                    // other recursive path in this file. It
+                                    // also measured zero net benefit on
+                                    // TaintBench before being found unsafe.
+                                    // See project memory
+                                    // (taintbench-sweep-findings) before
+                                    // reattempting; any retry needs the same
+                                    // in_progress-style reentrancy guard
+                                    // get_or_compute_ctx has, not just the
+                                    // one-level "does the field set exist"
+                                    // check this used.
                                 }
                             }
                             MethodSummary callee_sum;
@@ -1423,6 +1407,30 @@ namespace {
                             // through static fields across method boundaries
                             // are detected.  Only one level deep to bound cost;
                             // sub-callees still use cached summaries.
+                            //
+                            // This is a direct compute_summary_ctx call,
+                            // bypassing get_or_compute_ctx — so unlike every
+                            // other recursive path here, it does NOT
+                            // automatically register itself in
+                            // cache.in_progress/cache.call_stack. The
+                            // !cache.in_progress.count(...) guard below only
+                            // works if *something else* already marked this
+                            // key in-progress; on its own this call is
+                            // unguarded against reentrancy. Confirmed via a
+                            // SIGSEGV stack-overflow crash on TaintBench apps
+                            // (hummingbad_android_samp.apk, scipiex.apk,
+                            // vibleaker_android_samp.apk — pre-existing, not
+                            // introduced this session) where a callee reached
+                            // this way itself contained a call back into the
+                            // same probe pattern, recursing with no cycle
+                            // check until the stack overflowed. Fixed by
+                            // explicitly registering/unregistering in
+                            // cache.in_progress and cache.call_stack around
+                            // the call, matching what get_or_compute_ctx does
+                            // — this makes both the in_progress guard AND the
+                            // kMaxCallDepth cap in get_or_compute_ctx actually
+                            // effective for this path too (call_stack depth
+                            // accumulates correctly across nested probes).
                             if (!src_field_taint.empty()
                                 && !cache.in_progress.count(
                                         CtxKey{tgt, callee_ctx,
@@ -1442,6 +1450,10 @@ namespace {
                                                                         ->second]
                                                            .insns)
                                                > 0) {
+                                        CtxKey probe_key{tgt, callee_ctx,
+                                                         callee_src_ctx};
+                                        cache.in_progress.insert(probe_key);
+                                        cache.call_stack.push_back(probe_key);
                                         compute_summary_ctx(
                                                 vm, tgt, mv_callee->second,
                                                 cg, callee_ctx, callee_src_ctx,
@@ -1449,6 +1461,8 @@ namespace {
                                                 cache, lib_policy, sinks,
                                                 sink_hits, sources,
                                                 source_sink_hits);
+                                        cache.call_stack.pop_back();
+                                        cache.in_progress.erase(probe_key);
                                     }
                                 }
                             }
@@ -2109,6 +2123,25 @@ namespace {
         // used for unmodeled library methods rather than continuing to feed
         // a runaway cache-eviction cascade.
         if (cache.compute_calls >= CtxCache::kComputeBudget) {
+            return stub_summary(ctx.size(), lib_policy);
+        }
+
+        // Recursion-depth cap: get_or_compute_ctx and compute_summary_ctx
+        // are mutually recursive with no separate bound on call *depth*
+        // (kComputeBudget bounds total work across a whole seed, not how
+        // deep a single chain of calls can nest). Observed crashing with
+        // SIGSEGV (stack overflow) on real-world APKs
+        // (hummingbad_android_samp.apk) at ~2960 nested frames of
+        // get_or_compute_ctx<->compute_summary_ctx from a single top-level
+        // seed — no cycle for cache.in_progress to catch, just a very deep
+        // (or effectively unbounded, e.g. from a long synthetic AsyncTask
+        // bridge / one-level-deep-probe chain) acyclic call chain. 300 is
+        // far above any legitimate call depth seen in DroidBench or the
+        // TaintBench corpus but far below the depth that actually
+        // overflows the stack, so this should only trip on genuine
+        // pathological chains.
+        static constexpr std::size_t kMaxCallDepth = 300;
+        if (cache.call_stack.size() >= kMaxCallDepth) {
             return stub_summary(ctx.size(), lib_policy);
         }
 
