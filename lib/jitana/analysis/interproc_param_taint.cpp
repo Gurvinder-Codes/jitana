@@ -125,14 +125,33 @@ namespace {
     }
 
     // Stable string key for a field: "Ltype;.name:Ftype;"
+    //
+    // vm.make_jvm_hdl(dex_field_hdl) re-decodes the field's class/name/type
+    // strings straight out of the dex string pool on every call (no caching
+    // in the vm_core layer). This function is called on every iget/iput/
+    // sget/sput instruction, on every fixed-point iteration, for every
+    // (method, context) pair the context-sensitive analysis explores — which
+    // for real-world apps can be a very large number of calls for the exact
+    // same instruction. Profiling a hung TaintBench run (chulia.apk) showed
+    // ~30% of total runtime in this string rebuilding alone. A given
+    // dex_field_hdl's (file, idx) pair always denotes the same field for the
+    // process lifetime, so the result is safe to memoize globally.
     static std::string get_field_key(virtual_machine& vm, const insn& insn_obj)
     {
         auto fhdl_ptr = const_val<dex_field_hdl>(insn_obj);
         if (!fhdl_ptr) {
             return "";
         }
+        static std::unordered_map<uint32_t, std::string> cache;
+        auto key = static_cast<uint32_t>(*fhdl_ptr);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
         auto jfhdl = vm.make_jvm_hdl(*fhdl_ptr);
-        return jfhdl.type_hdl.descriptor + "." + jfhdl.unique_name;
+        auto result = jfhdl.type_hdl.descriptor + "." + jfhdl.unique_name;
+        cache.emplace(key, result);
+        return result;
     }
 
     // Keys for the object-sensitive FieldTaintMap:
@@ -190,10 +209,25 @@ namespace {
         return MethodId{hdl.type_hdl, parts.first, parts.second};
     }
 
+    // Same rationale/caching as get_field_key below: vm.make_jvm_hdl(dex_method_hdl)
+    // re-decodes the method's class/name/descriptor straight out of the dex
+    // string pool on every call, and this runs once per invoke instruction
+    // per fixed-point iteration per (method, context) pair explored — by far
+    // the hottest path in the whole analysis (see get_field_key's comment).
+    // A given dex_method_hdl's (file, idx) always denotes the same method for
+    // the process lifetime, so memoize globally.
     MethodId make_method_id_local(const virtual_machine& vm,
                                   const dex_method_hdl& hdl)
     {
-        return make_method_id_local(vm.make_jvm_hdl(hdl));
+        static std::unordered_map<uint32_t, MethodId> cache;
+        auto key = static_cast<uint32_t>(hdl);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+        auto result = make_method_id_local(vm.make_jvm_hdl(hdl));
+        cache.emplace(key, result);
+        return result;
     }
 
     bool normalize_reg(const register_idx& reg,
@@ -492,9 +526,14 @@ namespace {
     struct CtxKey {
         MethodId mid;
         CallContext ctx;
+        // Which of this method's params are source-API-derived (e.g. from
+        // getStringExtra/getSimCountryIso) at this call site. Distinct from
+        // ctx (generic param-taint) so a call with source-tainted args isn't
+        // conflated with — or its summary reused for — a call without them.
+        CallContext src_ctx;
         bool operator==(const CtxKey& o) const
         {
-            return mid == o.mid && ctx == o.ctx;
+            return mid == o.mid && ctx == o.ctx && src_ctx == o.src_ctx;
         }
     };
 
@@ -503,6 +542,7 @@ namespace {
         {
             std::size_t h = MethodIdHash{}(k.mid);
             boost::hash_combine(h, hash_call_context(k.ctx));
+            boost::hash_combine(h, hash_call_context(k.src_ctx));
             return h;
         }
     };
@@ -524,6 +564,27 @@ namespace {
         // descriptors (including itself).
         std::unordered_map<std::string, std::unordered_set<std::string>>
                 supertype_cache;
+        // Safety valve against the optimistic-fixed-point's cache-eviction
+        // cascade: added_during eviction is necessary for correctness on
+        // genuine mutual-recursion cycles (a callee's summary computed
+        // against a still-growing enclosing interim really can go stale),
+        // but it evicts every summary touched during an iteration, not just
+        // ones that actually depended on the cycle. For a tight recursive
+        // cluster this can blow up to roughly MAX_ITER^depth re-computation
+        // even when the total number of distinct (method,context) pairs
+        // involved is tiny — observed hanging TaintBench's chulia.apk (a
+        // small open-source Base64 library with a few mutually-recursive
+        // methods) indefinitely despite fewer than 500 total analyses ever
+        // completing. compute_calls counts compute_summary_ctx invocations
+        // since it was last reset (once per top-level seed method / lifecycle
+        // callback — see run_interproc_param_taint); once it crosses
+        // kComputeBudget, get_or_compute_ctx stops starting fresh analyses
+        // and falls back to the same conservative stub already used for
+        // unmodeled library methods, bounding worst-case work per seed
+        // instead of fixing the underlying over-eager invalidation (see
+        // memory for the precise "cycle-touch" fix considered and deferred).
+        std::size_t compute_calls = 0;
+        static constexpr std::size_t kComputeBudget = 20000;
     };
 
     // Forward declaration — compute_summary_ctx and get_or_compute_ctx are
@@ -533,6 +594,7 @@ namespace {
             const MethodId& mid,
             const CallGraph& cg,
             const CallContext& ctx,
+            const CallContext& src_ctx,
             CtxCache& cache,
             LibPolicy lib_policy,
             const std::vector<SinkSpec>& sinks,
@@ -542,6 +604,11 @@ namespace {
 
     // Intra-method dataflow analysis for one (method, entry context) pair.
     // entry_ctx specifies which of the method's own params are tainted at entry.
+    // entry_src_ctx specifies which of the method's own params are source-API
+    // -derived (e.g. getStringExtra) at entry, because the caller passed a
+    // source-tainted actual argument for that parameter. Distinct from
+    // pre_src_field_taint, which is about FIELD state carried across lifecycle
+    // phases, not per-parameter state carried across a single call.
     // pre_src_field_taint seeds the source-taint field map before the fixed-point
     // loop; used in the lifecycle second pass to carry source-tainted field state
     // from prior lifecycle callbacks into the current one.
@@ -552,6 +619,7 @@ namespace {
             const method_vertex_descriptor& mv,
             const CallGraph& cg,
             const CallContext& entry_ctx,
+            const CallContext& entry_src_ctx,
             const std::unordered_set<std::string>& pre_src_field_taint,
             CtxCache& cache,
             LibPolicy lib_policy,
@@ -560,6 +628,7 @@ namespace {
             const std::vector<SourceSpec>& sources,
             std::vector<SourceHit>& source_sink_hits)
     {
+        ++cache.compute_calls;
         MethodSummary sum;
         const auto& mg = vm.methods();
         const auto& ig = mg[mv].insns;
@@ -633,6 +702,19 @@ namespace {
             }
         }
 
+        // Seed only the parameters listed in entry_src_ctx: mirrors param_seed
+        // above, but for the source-taint domain (which params are derived
+        // from a known source API in the caller, e.g. getStringExtra).
+        std::vector<uint8_t> src_param_seed(reg_domain, 0);
+        if (sum.param_count <= reg_domain) {
+            const auto start = reg_domain - sum.param_count;
+            for (std::size_t i = 0; i < sum.param_count; ++i) {
+                if (i < entry_src_ctx.size() && entry_src_ctx.test(i)) {
+                    src_param_seed[start + i] = 1;
+                }
+            }
+        }
+
         // Flow-insensitive field taint: tracks which source params taint each
         // field within this method.  Grows monotonically; convergence is
         // guaranteed.  Keyed by stable JVM field descriptor.
@@ -675,7 +757,17 @@ namespace {
                 // Look up (or lazily build) the full supertype set for m.type.
                 auto& supertypes = cache.supertype_cache[m.type.descriptor];
                 if (supertypes.empty()) {
-                    if (auto cv = lookup_class_vertex(m.type, vm.classes())) {
+                    // m.type is keyed to the callee's own dex/app loader, but
+                    // framework stub classes (e.g. OutputStreamWriter) are
+                    // only ever registered under the bootstrap loader's own
+                    // handle (seed_placeholder_classes) and never reached by
+                    // ordinary inheritance resolution from the app's classes.
+                    // A bare jvm_hdl_to_vertex lookup keyed on m.type's own
+                    // loader therefore misses them; vm.find_class walks the
+                    // loader parent chain (app -> bootstrap) so it finds
+                    // bootstrap-registered placeholders too, and caches the
+                    // result under m.type for subsequent lookups.
+                    if (auto cv = vm.find_class(m.type, false)) {
                         collect_supertype_descriptors(*cv, vm.classes(),
                                                       supertypes);
                     } else {
@@ -751,7 +843,25 @@ namespace {
         std::vector<MethodId> src_callee_origin(n);
 
         bool changed = true;
-        while (changed) {
+        // Safety cap on the intraprocedural fixed point: DepSets are supposed
+        // to only grow, which for a finite lattice guarantees convergence
+        // within a small number of passes (bounded by param_count/register
+        // count) — legitimate methods converge in single/low-double digits.
+        // Observed TaintBench's chulia.apk (an open-source Base64 library)
+        // oscillating non-monotonically in a 13-instruction constructor for
+        // 1.7M+ iterations without ever converging, meaning some code path
+        // violates the monotonic-growth invariant for that instruction shape
+        // (root cause not identified — deferred; see project memory). The
+        // outer interprocedural recursion already has an analogous cap
+        // (get_or_compute_ctx's MAX_ITER=16), but nothing previously bounded
+        // this inner per-method loop. kMaxInnerIter is set far above any
+        // legitimate convergence count so it only trips on genuine
+        // non-termination; when it trips, analysis proceeds with whatever
+        // (possibly not fully converged) state exists rather than hanging.
+        static constexpr std::size_t kMaxInnerIter = 5000;
+        std::size_t inner_iters = 0;
+        while (changed && inner_iters < kMaxInnerIter) {
+            ++inner_iters;
             changed = false;
             for (std::size_t i = 0; i < n; ++i) {
                 const auto v = order[i];
@@ -789,6 +899,7 @@ namespace {
                 }
                 if (!saw_pred) {
                     new_in = param_seed;
+                    new_src_in = src_param_seed;
                 }
 
                 auto new_out = new_in;
@@ -939,12 +1050,24 @@ namespace {
                         // Derive the callee's context: which of its params
                         // are tainted based on the actual argument registers.
                         CallContext callee_ctx(invoke->args.size());
+                        // Mirror callee_ctx for the source-taint domain: which
+                        // of the callee's params are source-API-derived based
+                        // on the actual argument registers at this call site.
+                        // This is what lets e.g. saveData(intent.getStringExtra(...))
+                        // detect the sink inside saveData as a proper
+                        // source-to-sink flow instead of only a generic
+                        // param-taint sink hit.
+                        CallContext callee_src_ctx(invoke->args.size());
                         for (std::size_t pi = 0; pi < invoke->args.size();
                              ++pi) {
                             auto arg_reg = invoke->args[pi];
                             if (arg_reg < new_in.size()
                                 && new_in[arg_reg].any()) {
                                 callee_ctx.set(pi);
+                            }
+                            if (arg_reg < new_src_in.size()
+                                && new_src_in[arg_reg]) {
+                                callee_src_ctx.set(pi);
                             }
                         }
 
@@ -987,6 +1110,110 @@ namespace {
                                 }
                                 continue;
                             }
+                            // AsyncTask.execute(params)/executeOnExecutor(exec,params):
+                            // the framework internally invokes
+                            // doInBackground(params) on the same receiver with
+                            // the same array — but that call is dispatched by
+                            // the framework at runtime, not by a bytecode
+                            // invoke instruction, so the ordinary call graph
+                            // never sees it. Model it directly: link the
+                            // trailing array argument (and receiver) into the
+                            // generic-erasure doInBackground bridge
+                            // ([Ljava/lang/Object;)Ljava/lang/Object; — which
+                            // for a Params type other than Object is a real
+                            // compiled bridge method that itself invokes the
+                            // typed doInBackground via an ordinary call (so no
+                            // further special-casing is needed beyond this
+                            // one hop), and for Params==Object is the real
+                            // method directly.
+                            if ((tgt.name == "execute"
+                                 || tgt.name == "executeOnExecutor")
+                                && !invoke->args.empty()) {
+                                auto receiver_r = invoke->args[0];
+                                auto array_r = invoke->args.back();
+                                MethodId bridge_mid(
+                                        tgt.type, "doInBackground",
+                                        "([Ljava/lang/Object;)"
+                                        "Ljava/lang/Object;");
+                                auto bridge_mv =
+                                        cg.method_vertices.find(bridge_mid);
+                                if (bridge_mv != cg.method_vertices.end()
+                                    && num_vertices(vm.methods()[bridge_mv
+                                                                          ->second]
+                                                             .insns)
+                                               > 0) {
+                                    CallContext bridge_ctx(2);
+                                    CallContext bridge_src_ctx(2);
+                                    if (receiver_r < new_in.size()
+                                        && new_in[receiver_r].any()) {
+                                        bridge_ctx.set(0);
+                                    }
+                                    if (array_r < new_in.size()
+                                        && new_in[array_r].any()) {
+                                        bridge_ctx.set(1);
+                                    }
+                                    if (receiver_r < new_src_in.size()
+                                        && new_src_in[receiver_r]) {
+                                        bridge_src_ctx.set(0);
+                                    }
+                                    if (array_r < new_src_in.size()
+                                        && new_src_in[array_r]) {
+                                        bridge_src_ctx.set(1);
+                                    }
+                                    get_or_compute_ctx(
+                                            vm, bridge_mid, cg, bridge_ctx,
+                                            bridge_src_ctx, cache, lib_policy,
+                                            sinks, sink_hits, sources,
+                                            source_sink_hits);
+
+                                    // Field-taint doesn't ride along with
+                                    // bridge_ctx/bridge_src_ctx above (those
+                                    // are register-only, and get_or_compute_ctx
+                                    // is cached so pre_src_field_taint can't be
+                                    // threaded through it without becoming part
+                                    // of the cache key). Mirror the static
+                                    // -field one-level-deep probe elsewhere in
+                                    // this loop: if this caller's own
+                                    // src_field_taint has STATIC:/FIELD:
+                                    // entries (e.g. an inner AsyncTask's
+                                    // captured this$0 outer-instance field, or
+                                    // a singleton reached via a static field —
+                                    // both export as instance-insensitive
+                                    // "FIELD:"/"STATIC:" keys, see
+                                    // source_field_writes export below), feed
+                                    // them into a direct, uncached
+                                    // compute_summary_ctx call so
+                                    // doInBackground can see them. This is the
+                                    // common "AsyncTask constructed with empty
+                                    // Void params, reads a field set before
+                                    // .execute() was called" pattern that the
+                                    // array-argument bridging above doesn't
+                                    // cover at all.
+                                    if (!src_field_taint.empty()
+                                        && !cache.in_progress.count(
+                                                CtxKey{bridge_mid, bridge_ctx,
+                                                       bridge_src_ctx})) {
+                                        std::unordered_set<std::string>
+                                                global_sft;
+                                        for (const auto& sk : src_field_taint) {
+                                            if (sk.rfind("STATIC:", 0) == 0
+                                                || sk.rfind("FIELD:", 0) == 0) {
+                                                global_sft.insert(sk);
+                                            }
+                                        }
+                                        if (!global_sft.empty()) {
+                                            compute_summary_ctx(
+                                                    vm, bridge_mid,
+                                                    bridge_mv->second, cg,
+                                                    bridge_ctx, bridge_src_ctx,
+                                                    global_sft, cache,
+                                                    lib_policy, sinks,
+                                                    sink_hits, sources,
+                                                    source_sink_hits);
+                                        }
+                                    }
+                                }
+                            }
                             MethodSummary callee_sum;
                             if (callee_ctx.none() && sources.empty()) {
                                 // No tainted args and no source tracking —
@@ -1001,7 +1228,8 @@ namespace {
                                 // src_return_dep is populated (source-taint is
                                 // context-independent).
                                 callee_sum = get_or_compute_ctx(
-                                        vm, tgt, cg, callee_ctx, cache,
+                                        vm, tgt, cg, callee_ctx,
+                                        callee_src_ctx, cache,
                                         lib_policy, sinks, sink_hits,
                                         sources, source_sink_hits);
                             }
@@ -1197,7 +1425,8 @@ namespace {
                             // sub-callees still use cached summaries.
                             if (!src_field_taint.empty()
                                 && !cache.in_progress.count(
-                                        CtxKey{tgt, callee_ctx})) {
+                                        CtxKey{tgt, callee_ctx,
+                                               callee_src_ctx})) {
                                 std::unordered_set<std::string> static_sft;
                                 for (const auto& sk : src_field_taint) {
                                     if (sk.rfind("STATIC:", 0) == 0) {
@@ -1215,7 +1444,8 @@ namespace {
                                                > 0) {
                                         compute_summary_ctx(
                                                 vm, tgt, mv_callee->second,
-                                                cg, callee_ctx, static_sft,
+                                                cg, callee_ctx, callee_src_ctx,
+                                                static_sft,
                                                 cache, lib_policy, sinks,
                                                 sink_hits, sources,
                                                 source_sink_hits);
@@ -1230,6 +1460,20 @@ namespace {
                     // constructing an object with tainted data makes the object
                     // a tainted carrier (e.g. RuntimeException(imei), PointF).
                     // Only applied with Conservative stub policy.
+                    //
+                    // NOTE: an earlier attempt widened this to ALSO cover
+                    // void-returning instance mutators generally (setEntity,
+                    // addHeader, add, put, ...), not just <init> — reasoning
+                    // that e.g. httpPost.setEntity(taintedEntity) should make
+                    // httpPost itself a tainted carrier. Reverted: it caused a
+                    // real DroidBench regression (TP 130->126, Threading and
+                    // EmulatorDetection lost previously-passing tests) — the
+                    // broader trigger meaningfully increases per-call taint
+                    // -propagation work, and some of that regression tracked
+                    // with cases now hitting the compute-budget/inner-iteration
+                    // safety valves that a narrower trigger wouldn't have hit.
+                    // Left as a documented but NOT reattempted idea; see
+                    // project memory.
                     if (invoke
                         && lib_policy == LibPolicy::Conservative
                         && invoke->callee.name == "<init>"
@@ -1728,6 +1972,9 @@ namespace {
                 if (!saw_pred) {
                     for (std::size_t r = 0; r < reg_domain; ++r) {
                         new_out[r] |= param_seed[r];
+                        if (src_param_seed[r]) {
+                            new_src_out[r] = 1;
+                        }
                     }
                 }
 
@@ -1820,6 +2067,7 @@ namespace {
             const MethodId& mid,
             const CallGraph& cg,
             const CallContext& ctx,
+            const CallContext& src_ctx,
             CtxCache& cache,
             LibPolicy lib_policy,
             const std::vector<SinkSpec>& sinks,
@@ -1827,7 +2075,7 @@ namespace {
             const std::vector<SourceSpec>& sources,
             std::vector<SourceHit>& source_sink_hits)
     {
-        CtxKey key{mid, ctx};
+        CtxKey key{mid, ctx, src_ctx};
 
         // Already computed?
         {
@@ -1856,6 +2104,14 @@ namespace {
             return stub_summary(ctx.size(), lib_policy);
         }
 
+        // Work budget exhausted (see CtxCache::compute_calls) — don't start a
+        // fresh analysis; fall back to the same conservative stub already
+        // used for unmodeled library methods rather than continuing to feed
+        // a runaway cache-eviction cascade.
+        if (cache.compute_calls >= CtxCache::kComputeBudget) {
+            return stub_summary(ctx.size(), lib_policy);
+        }
+
         // Seed interim at bottom of lattice (optimistic: assume no taint).
         {
             MethodSummary opt;
@@ -1871,6 +2127,7 @@ namespace {
         static constexpr int MAX_ITER = 16;
         for (int iter = 0; iter < MAX_ITER; ++iter) {
             sum = compute_summary_ctx(vm, mid, mv_it->second, cg, ctx,
+                                      src_ctx,
                                       /*pre_src_field_taint=*/{},
                                       cache, lib_policy, sinks, sink_hits,
                                       sources, source_sink_hits);
@@ -2149,6 +2406,19 @@ namespace {
                  "(Ljava/lang/CharSequence;)Ljava/io/Writer;"},
                 {"Ljava/io/OutputStreamWriter;", "append",
                  "(Ljava/lang/CharSequence;)Ljava/io/Writer;"},
+                // DataOutputStream's own byte/UTF-string write overloads —
+                // same family as the generic OutputStream.write above.
+                {"Ljava/io/DataOutputStream;", "writeBytes",
+                 "(Ljava/lang/String;)V"},
+                {"Ljava/io/DataOutputStream;", "writeUTF",
+                 "(Ljava/lang/String;)V"},
+                // flush() takes no data argument of its own, but if the
+                // stream object itself already carries taint (e.g. from a
+                // preceding tainted .write() call — see the receiver
+                // contamination in maybe_report_source_sink) a later
+                // flush() on that same object is also a source-to-sink hit.
+                {"Ljava/io/OutputStream;", "flush", "()V"},
+                {"Ljava/io/Writer;", "flush", "()V"},
 
                 // -------------------------------------------------------
                 // Network — tainted URL / hostname / port / socket
@@ -2169,6 +2439,16 @@ namespace {
                 {"Ljava/net/URLConnection;", "connect", "()V"},
                 {"Ljava/net/URLConnection;", "getOutputStream",
                  "()Ljava/io/OutputStream;"},
+                // getInputStream is also a source (response body), but the
+                // *call itself* is what actually sends a request whose URL
+                // may carry tainted data embedded as query params (GET-based
+                // exfiltration, as opposed to getOutputStream's POST body) —
+                // so it's listed as a sink too, matching how it's used across
+                // several TaintBench samples.
+                {"Ljava/net/URLConnection;", "getInputStream",
+                 "()Ljava/io/InputStream;"},
+                {"Ljava/net/HttpURLConnection;", "getInputStream",
+                 "()Ljava/io/InputStream;"},
                 {"Lorg/apache/http/impl/client/DefaultHttpClient;",
                  "execute",
                  "(Lorg/apache/http/client/methods/HttpUriRequest;)"
@@ -2177,6 +2457,13 @@ namespace {
                  "execute",
                  "(Lorg/apache/http/client/methods/HttpUriRequest;)"
                  "Lorg/apache/http/HttpResponse;"},
+                // Spring RestTemplate — common in a handful of samples as an
+                // alternative REST client to HttpClient/HttpURLConnection.
+                {"Lorg/springframework/web/client/RestTemplate;", "exchange",
+                 "(Ljava/lang/String;Lorg/springframework/http/HttpMethod;"
+                 "Lorg/springframework/http/HttpEntity;Ljava/lang/Class;"
+                 "[Ljava/lang/Object;)"
+                 "Lorg/springframework/http/ResponseEntity;"},
 
                 // -------------------------------------------------------
                 // Android logging — information disclosure via logcat
@@ -2234,6 +2521,12 @@ namespace {
                  "Ljava/lang/String;)V"},
                 {"Landroid/webkit/WebView;", "evaluateJavascript",
                  "(Ljava/lang/String;Landroid/webkit/ValueCallback;)V"},
+                // Bridges a Java object into WebView's JS context — if the
+                // bridged object carries tainted data (e.g. device
+                // identifiers set as fields), JS content can read it back
+                // out.  arg1 is the bridged Object, arg2 the JS-visible name.
+                {"Landroid/webkit/WebView;", "addJavascriptInterface",
+                 "(Ljava/lang/Object;Ljava/lang/String;)V"},
 
                 // -------------------------------------------------------
                 // SMS
@@ -2248,6 +2541,13 @@ namespace {
                  "(Ljava/lang/String;Ljava/lang/String;"
                  "Ljava/util/ArrayList;Ljava/util/ArrayList;"
                  "Ljava/util/ArrayList;)V"},
+
+                // -------------------------------------------------------
+                // Third-party cloud storage SDKs — file/object upload
+                // -------------------------------------------------------
+                {"Lcom/baidu/inf/iis/bcs/BaiduBCS;", "putObject",
+                 "(Lcom/baidu/inf/iis/bcs/request/PutObjectRequest;)"
+                 "Lcom/baidu/inf/iis/bcs/response/BaiduBCSResponse;"},
 
                 // -------------------------------------------------------
                 // JNDI
@@ -2399,6 +2699,23 @@ namespace {
                 {"Landroid/content/SharedPreferences$Editor;", "putString",
                  "(Ljava/lang/String;Ljava/lang/String;)"
                  "Landroid/content/SharedPreferences$Editor;"},
+                // commit() itself carries no data argument, but the put*
+                // calls above return `this`, so a tainted put chained into
+                // .commit() contaminates the Editor receiver (same receiver
+                // -contamination path noted for flush() above) — listing it
+                // lets that chain be detected at its natural sink location.
+                {"Landroid/content/SharedPreferences$Editor;", "commit",
+                 "()Z"},
+
+                // -------------------------------------------------------
+                // ContentValues — tainted data staged for a DB insert/update
+                // -------------------------------------------------------
+                {"Landroid/content/ContentValues;", "put",
+                 "(Ljava/lang/String;Ljava/lang/String;)V"},
+                {"Landroid/content/ContentValues;", "put",
+                 "(Ljava/lang/String;Ljava/lang/Integer;)V"},
+                {"Landroid/content/ContentValues;", "put",
+                 "(Ljava/lang/String;Ljava/lang/Long;)V"},
 
                 // -------------------------------------------------------
                 // MediaRecorder — tainted audio/video recording
@@ -2610,6 +2927,14 @@ namespace {
                  "()Ljava/lang/String;"},
                 {"Landroid/telephony/TelephonyManager;", "getLine1Number",
                  "()Ljava/lang/String;"},
+                {"Landroid/telephony/TelephonyManager;", "getSimCountryIso",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/TelephonyManager;", "getNetworkCountryIso",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/TelephonyManager;", "getNetworkOperator",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/TelephonyManager;", "getNetworkOperatorName",
+                 "()Ljava/lang/String;"},
 
                 // Cell location
                 {"Landroid/telephony/gsm/GsmCellLocation;", "getCid", "()I"},
@@ -2622,6 +2947,51 @@ namespace {
                  "()Ljava/lang/String;"},
                 {"Landroid/bluetooth/BluetoothAdapter;", "getAddress",
                  "()Ljava/lang/String;"},
+                // getConnectionInfo() itself, in addition to WifiInfo's own
+                // accessors above — some samples pass the whole WifiInfo
+                // object onward (e.g. via toString()) rather than calling
+                // getMacAddress/getSSID directly.
+                {"Landroid/net/wifi/WifiManager;", "getConnectionInfo",
+                 "()Landroid/net/wifi/WifiInfo;"},
+
+                // Incoming SMS — PDU parsing and content/sender accessors.
+                // createFromPdu is the standard BroadcastReceiver pattern for
+                // android.provider.Telephony.SMS_RECEIVED; both the modern
+                // and legacy (android.telephony.gsm) SmsMessage classes
+                // appear across real-world samples.
+                {"Landroid/telephony/SmsMessage;", "createFromPdu",
+                 "([B)Landroid/telephony/SmsMessage;"},
+                {"Landroid/telephony/gsm/SmsMessage;", "createFromPdu",
+                 "([B)Landroid/telephony/gsm/SmsMessage;"},
+                {"Landroid/telephony/SmsMessage;", "getDisplayMessageBody",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/gsm/SmsMessage;", "getDisplayMessageBody",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/SmsMessage;", "getMessageBody",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/gsm/SmsMessage;", "getMessageBody",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/SmsMessage;",
+                 "getDisplayOriginatingAddress", "()Ljava/lang/String;"},
+                {"Landroid/telephony/gsm/SmsMessage;",
+                 "getDisplayOriginatingAddress", "()Ljava/lang/String;"},
+                {"Landroid/telephony/SmsMessage;", "getOriginatingAddress",
+                 "()Ljava/lang/String;"},
+                {"Landroid/telephony/gsm/SmsMessage;", "getOriginatingAddress",
+                 "()Ljava/lang/String;"},
+
+                // Directory listing — enumerating device files (photos,
+                // documents, etc.) as a precursor to exfiltrating them.
+                {"Ljava/io/File;", "listFiles",
+                 "()[Ljava/io/File;"},
+
+                // UI widget content — reading user-typed input directly
+                // (e.g. a fake login screen harvesting typed credentials),
+                // as opposed to a value arriving via Intent/source API.
+                {"Landroid/widget/EditText;", "getText",
+                 "()Landroid/text/Editable;"},
+                {"Landroid/widget/TextView;", "getText",
+                 "()Ljava/lang/CharSequence;"},
 
                 // Audio capture
                 {"Landroid/media/AudioRecord;", "read", "([SII)I"},
@@ -2856,8 +3226,16 @@ InterprocParamResult run_interproc_param_taint(virtual_machine& vm,
         // Seed: all params of this method are tainted.
         CallContext entry_ctx(param_count);
         entry_ctx.set();
+        // No caller passing source-tainted args at a true entry point — only
+        // a direct source-API call inside the method itself can set src taint.
+        CallContext entry_src_ctx(param_count);
 
-        auto sum = get_or_compute_ctx(vm, mid, cg, entry_ctx, cache,
+        // Reset the work budget per seed method: a pathological
+        // mutually-recursive cluster reachable from one seed shouldn't
+        // starve the budget for every other, unrelated seed method.
+        cache.compute_calls = 0;
+        auto sum = get_or_compute_ctx(vm, mid, cg, entry_ctx, entry_src_ctx,
+                                      cache,
                                       config.lib_policy, sinks,
                                       result.sink_hits,
                                       sources, result.source_sink_hits);
@@ -3026,8 +3404,13 @@ InterprocParamResult run_interproc_param_taint(virtual_machine& vm,
                 const auto param_count2 = ig2[boost::graph_bundle].ins_size;
                 CallContext lctx(param_count2);
                 lctx.set();
+                // True entry point: no caller passing source-tainted args.
+                CallContext lsrc_ctx(param_count2);
+                // Reset the work budget per lifecycle callback (see
+                // CtxCache::compute_calls).
+                cache.compute_calls = 0;
                 auto lsum = compute_summary_ctx(
-                        vm, lmid, mv_it2->second, cg, lctx,
+                        vm, lmid, mv_it2->second, cg, lctx, lsrc_ctx,
                         accumulated,
                         cache, config.lib_policy, sinks,
                         result.sink_hits, sources,

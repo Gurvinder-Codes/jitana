@@ -129,13 +129,29 @@ static void seed_placeholder_classes(virtual_machine& vm) {
         "Ljava/lang/reflect/AccessibleObject;",
         // Java I/O
         "Ljava/io/PrintStream;",
+        "Ljava/io/OutputStream;",
         "Ljava/io/FileOutputStream;",
+        "Ljava/io/FilterOutputStream;",
+        "Ljava/io/DataOutputStream;",
+        "Ljava/io/BufferedOutputStream;",
+        "Ljava/io/InputStream;",
         "Ljava/io/FileInputStream;",
+        "Ljava/io/FilterInputStream;",
+        "Ljava/io/DataInputStream;",
+        "Ljava/io/BufferedInputStream;",
+        "Ljava/io/Writer;",
+        "Ljava/io/OutputStreamWriter;",
         "Ljava/io/FileWriter;",
+        "Ljava/io/BufferedWriter;",
+        "Ljava/io/PrintWriter;",
+        "Ljava/io/Reader;",
+        "Ljava/io/InputStreamReader;",
+        "Ljava/io/BufferedReader;",
         "Ljava/io/RandomAccessFile;",
         // Java networking
         "Ljava/net/URL;",
         "Ljava/net/Socket;",
+        "Ljava/net/URLConnection;",
         "Ljava/net/HttpURLConnection;",
         // Android telephony
         "Landroid/telephony/TelephonyManager;",
@@ -187,6 +203,44 @@ static void seed_placeholder_classes(virtual_machine& vm) {
     for (const char* desc : kBootstrapTypes) {
         ensure_placeholder_class(vm, {class_loader_hdl{BOOTSTRAP_LOADER_ID}, desc});
     }
+
+    // Placeholder classes above have no bytecode of their own, so unlike app
+    // classes (wired up by dex_file::load_class from real class_def_item
+    // superclass_idx values) they get no class_super_edge_property links.
+    // Sink/source subtype matching (collect_supertype_descriptors) walks
+    // those edges, so without them a call statically typed as e.g.
+    // OutputStreamWriter.write(...) or HttpURLConnection.getOutputStream()
+    // never matches the generic Writer.write(...) / URLConnection sink
+    // specs. Wire up the real java.io / java.net hierarchy here so subtype
+    // matching works for framework stream/connection wrapper types.
+    auto link = [&](const char* sub_desc, const char* super_desc) {
+        auto sub_v = ensure_placeholder_class(
+                vm, {class_loader_hdl{BOOTSTRAP_LOADER_ID}, sub_desc});
+        auto super_v = ensure_placeholder_class(
+                vm, {class_loader_hdl{BOOTSTRAP_LOADER_ID}, super_desc});
+        add_edge(super_v, sub_v, class_super_edge_property{false},
+                 vm.classes());
+    };
+
+    link("Ljava/io/FileOutputStream;", "Ljava/io/OutputStream;");
+    link("Ljava/io/FilterOutputStream;", "Ljava/io/OutputStream;");
+    link("Ljava/io/DataOutputStream;", "Ljava/io/FilterOutputStream;");
+    link("Ljava/io/BufferedOutputStream;", "Ljava/io/FilterOutputStream;");
+
+    link("Ljava/io/FileInputStream;", "Ljava/io/InputStream;");
+    link("Ljava/io/FilterInputStream;", "Ljava/io/InputStream;");
+    link("Ljava/io/DataInputStream;", "Ljava/io/FilterInputStream;");
+    link("Ljava/io/BufferedInputStream;", "Ljava/io/FilterInputStream;");
+
+    link("Ljava/io/OutputStreamWriter;", "Ljava/io/Writer;");
+    link("Ljava/io/FileWriter;", "Ljava/io/OutputStreamWriter;");
+    link("Ljava/io/BufferedWriter;", "Ljava/io/Writer;");
+    link("Ljava/io/PrintWriter;", "Ljava/io/Writer;");
+
+    link("Ljava/io/InputStreamReader;", "Ljava/io/Reader;");
+    link("Ljava/io/BufferedReader;", "Ljava/io/Reader;");
+
+    link("Ljava/net/HttpURLConnection;", "Ljava/net/URLConnection;");
 }
 
 struct DexSources {
@@ -1461,7 +1515,8 @@ int main(int argc, char** argv) {
                         if (i + 1 < hit.tainted_args.size()) args_ss << ",";
                     }
                     std::cout << "    [in " << caller_str << "] "
-                              << (src_str.empty() ? "<source>" : src_str)
+                              << (hit.source_callee.name.empty()
+                                          ? "<source>" : src_str)
                               << " -> " << sink_str
                               << " (" << args_ss.str() << ")"
                               << " @off " << hit.sink_offset << "\n";
