@@ -1523,6 +1523,53 @@ namespace {
                             }
                         }
                     }
+                    // StringBuilder/StringBuffer.append/insert receiver
+                    // taint: sb.append(taintedValue) as a bare statement
+                    // (return value unused, the overwhelmingly common way
+                    // this API is called) has no move-result to carry the
+                    // taint forward, so a later sb.toString() sees an
+                    // untainted receiver even though every append() call
+                    // leading up to it individually detected the appended
+                    // value as tainted. Root-caused via TaintBench's
+                    // roidsec.apk: getCallLogs() correctly marked each
+                    // Cursor.getString() result and each append() call's
+                    // (unused) return as tainted, but toString() came back
+                    // untainted because sb itself was never contaminated.
+                    // Deliberately much narrower than the reverted "all void
+                    // mutators" attempt above (which regressed DroidBench):
+                    // scoped to exactly these two well-known, ubiquitous
+                    // fluent-builder classes rather than every stub call, to
+                    // keep the added work — and thus safety-valve interaction
+                    // risk — minimal.
+                    else if (invoke
+                             && lib_policy == LibPolicy::Conservative
+                             && invoke->kind != InvokeKind::kStatic
+                             && (invoke->callee.type.descriptor
+                                         == "Ljava/lang/StringBuilder;"
+                                 || invoke->callee.type.descriptor
+                                            == "Ljava/lang/StringBuffer;")
+                             && (invoke->callee.name == "append"
+                                 || invoke->callee.name == "insert")
+                             && invoke->args.size() >= 2) {
+                        auto rcv_reg = invoke->args[0];
+                        bool any_src_tainted = false;
+                        for (std::size_t pi = 1; pi < invoke->args.size();
+                             ++pi) {
+                            auto arg_reg = invoke->args[pi];
+                            if (arg_reg < new_in.size()
+                                && new_in[arg_reg].any()
+                                && rcv_reg < new_out.size()) {
+                                new_out[rcv_reg] |= new_in[arg_reg];
+                            }
+                            if (arg_reg < new_src_in.size()
+                                && new_src_in[arg_reg]) {
+                                any_src_tainted = true;
+                            }
+                        }
+                        if (any_src_tainted && rcv_reg < new_src_out.size()) {
+                            new_src_out[rcv_reg] = 1;
+                        }
+                    }
                 }
                 else if (opcode_val == opcode::op_move_result
                          || opcode_val == opcode::op_move_result_object
