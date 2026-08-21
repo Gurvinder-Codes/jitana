@@ -1570,6 +1570,43 @@ namespace {
                             new_src_out[rcv_reg] = 1;
                         }
                     }
+                    // Apache HttpClient request-builder receiver taint:
+                    // new HttpPost(url); post.setEntity(taintedEntity);
+                    // client.execute(post); is a very common request-building
+                    // pattern in older Android code (this library predates
+                    // HttpURLConnection-based code in a lot of malware
+                    // samples, including TaintBench's chulia.apk). setEntity
+                    // is void-returning (no move-result to piggyback on,
+                    // same fundamental issue as the StringBuilder case
+                    // above, just without the fluent-chaining angle) and
+                    // never marks its receiver (the request object) tainted
+                    // on its own, so a later client.execute(post) sink check
+                    // sees an untainted request even though the entity
+                    // attached to it was tainted. Matched by method name +
+                    // parameter type rather than a fixed list of concrete
+                    // request classes (HttpPost, HttpPut, ..., all sharing
+                    // this one HttpEntityEnclosingRequest-family method) —
+                    // still narrow (name AND exact single-arg descriptor),
+                    // not a general "any void call" trigger.
+                    else if (invoke
+                             && lib_policy == LibPolicy::Conservative
+                             && invoke->kind != InvokeKind::kStatic
+                             && invoke->callee.name == "setEntity"
+                             && invoke->callee.descriptor
+                                        == "(Lorg/apache/http/HttpEntity;)V"
+                             && invoke->args.size() == 2) {
+                        auto rcv_reg = invoke->args[0];
+                        auto arg_reg = invoke->args[1];
+                        if (arg_reg < new_in.size() && new_in[arg_reg].any()
+                            && rcv_reg < new_out.size()) {
+                            new_out[rcv_reg] |= new_in[arg_reg];
+                        }
+                        if (arg_reg < new_src_in.size()
+                            && new_src_in[arg_reg]
+                            && rcv_reg < new_src_out.size()) {
+                            new_src_out[rcv_reg] = 1;
+                        }
+                    }
                 }
                 else if (opcode_val == opcode::op_move_result
                          || opcode_val == opcode::op_move_result_object
