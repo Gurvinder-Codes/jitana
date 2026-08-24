@@ -162,6 +162,15 @@ static void seed_placeholder_classes(virtual_machine& vm) {
         "Landroid/util/Log;",
         // Android SQLite
         "Landroid/database/sqlite/SQLiteDatabase;",
+        // SQLiteOpenHelper — extremely common base class for custom DB
+        // helpers (class MyDbHelper extends SQLiteOpenHelper). Missing
+        // this meant any such subclass's superclass failed to resolve,
+        // silently failing to load the ENTIRE class (dex_file::load_class
+        // returns boost::none if any superclass/interface is unresolved) —
+        // confirmed via TaintBench's save_me.apk, where
+        // DatabaseOperationslogin (extends SQLiteOpenHelper) never
+        // appeared in any output at all.
+        "Landroid/database/sqlite/SQLiteOpenHelper;",
         // JNDI
         "Ljavax/naming/InitialContext;",
         // Android inter-app communication
@@ -170,7 +179,10 @@ static void seed_placeholder_classes(virtual_machine& vm) {
         "Landroid/content/Intent;",
         "Landroid/app/Activity;",
         "Landroid/app/Service;",
+        "Landroid/app/IntentService;",
         "Landroid/app/Application;",
+        "Landroid/app/Fragment;",
+        "Landroid/support/v4/app/Fragment;",
         "Landroid/content/BroadcastReceiver;",
         "Landroid/content/ContentProvider;",
         "Landroid/content/ContentResolver;",
